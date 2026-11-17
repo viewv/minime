@@ -24,5 +24,6 @@ esac
 if [ "$1" != arch ] && ! command -v cargo >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   # GitHub Actions：让后面的步骤能找到 cargo
-  [ -n "${GITHUB_PATH:-}" ] && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+  if [ -n "${GITHUB_PATH:-}" ]; then echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; fi
 fi
+exit 0

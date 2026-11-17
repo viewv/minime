@@ -15,6 +15,7 @@
   <CTX:文字> 发光标前文字（STR_SEND_TEXT_AROUND_CURSOR，104）
   <PRIV:0|1> 发空上下文并带字段 303：1 = 进入隐私输入框（引擎不学选词），0 = 离开
 缺省脚本："nihao <SEL:0>"
+环境变量 CANDS_N=显示几个候选（默认 9），CANDS_COMMENT=1 在候选后面带上备注（✦ 整句、☁ 云候选、⬡ 常用语）
 """
 import os
 import socket
@@ -114,11 +115,11 @@ class Client:
                    + f_varint(303, priv)])
 
     def select(self, i):
-        value, cid = self.cands[i]
+        value, cid = self.cands[i][:2]
         self.send([f_varint(1, 2) + f_bytes(5, f_bytes(1, value) + f_bytes(2, cid))])
 
     def block(self, i):
-        value, cid = self.cands[i]
+        value, cid = self.cands[i][:2]
         self.send([f_varint(1, 205) + f_bytes(5, f_bytes(1, value) + f_bytes(2, cid))])
 
     def drain(self, settle=0.25):
@@ -142,10 +143,11 @@ class Client:
                     for f3, w3, cw in fields(d.get(2, b'')):
                         if f3 == 1:
                             cf = {a: b for a, _, b in fields(cw)}
-                            self.cands.append((cf.get(1, b''), cf.get(2, b'')))
+                            self.cands.append((cf.get(1, b''), cf.get(2, b''), cf.get(9, b'')))
                         elif f3 == 3:
                             more = cw
-                    out.append('候选 ' + '/'.join(c[0].decode() for c in self.cands[:int(os.environ.get('CANDS_N', '9'))]) +
+                    show = (lambda c: c[0].decode() + c[2].decode()) if os.environ.get('CANDS_COMMENT') else (lambda c: c[0].decode())
+                    out.append('候选 ' + '/'.join(show(c) for c in self.cands[:int(os.environ.get('CANDS_N', '9'))]) +
                                f'（共 {len(self.cands)} 个{"，还有更多" if more else ""}）')
                 elif t == 3:
                     segs = []

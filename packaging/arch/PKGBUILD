@@ -12,7 +12,10 @@ license=('MPL-2.0')
 depends=('fcitx5' 'jemalloc' 'gcc-libs' 'glibc' 'vulkan-icd-loader' 'libxkbcommon' 'libxkbcommon-x11'
          'libxcb' 'wayland' 'fontconfig' 'python' 'p7zip' 'curl')
 makedepends=('git' 'cmake' 'rust' 'shaderc' 'vulkan-headers')
-optdepends=('wl-clipboard: 跨设备剪贴板同步'
+optdepends=('fcitx5-configtool: fcitx5 的图形配置界面'
+            'fcitx5-qt: 让 Qt 程序（X11 / XWayland）也能用输入法'
+            'fcitx5-gtk: 让 GTK 程序（X11 / XWayland）也能用输入法'
+            'wl-clipboard: 跨设备剪贴板同步'
             'pipewire: 离线语音录音（也可以用 libpulse 的 parec）')
 provides=("$_name")
 conflicts=("$_name")

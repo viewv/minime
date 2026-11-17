@@ -1,6 +1,6 @@
 [package]
 name = "minime-netd"
-version = "0.1.1"
+version = "0.1.2"
 license = "MPL-2.0"
 edition = "2021"
 description = "MinIME 原生网络服务：跨设备剪贴板等云功能（默认关闭）"

@@ -1422,12 +1422,17 @@ impl Settings {
     }
 }
 
-/// minime-fetch 下载的官方引擎在不在（开发环境用仓库里的 vendor/，不算）
-fn official_engine_present() -> bool {
+/// minime-fetch 把官方文件放在这里（~/.local/share/minime/official）
+fn official_dir() -> std::path::PathBuf {
     let data = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
-    data.join("minime/official/win/3.0.1.35/libwxhld.dll").exists()
+    data.join("minime/official")
+}
+
+/// minime-fetch 下载的官方引擎在不在（开发环境用仓库里的 vendor/，不算）
+fn official_engine_present() -> bool {
+    official_dir().join("win/3.0.1.35/libwxhld.dll").exists()
 }
 
 /// 各服务的 systemctl is-active 结果（没装的单元是 "inactive" 或 "unknown"，装没装另外看单元文件）
@@ -1744,7 +1749,23 @@ impl Settings {
             e2e_card = e2e_card.child(dict_row("icons/cpu.svg", model_title(&p.name), meta, Some(status), div(), i + 1 < n));
         }
         if n == 0 {
-            e2e_card = e2e_card.child(div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("库房里没有整句模型。"));
+            // 库房里没有（普通用户都是这样）：显示 minime-fetch 下载的模型
+            let dir = official_dir().join("mac/imeData");
+            let files: Vec<(&str, u64)> = ["decgnr.bin", "mpd_e2e.bin"]
+                .iter()
+                .filter_map(|f| std::fs::metadata(dir.join(f)).ok().map(|m| (*f, m.len())))
+                .collect();
+            if files.len() == 2 {
+                for (i, (f, size)) in files.iter().enumerate() {
+                    let meta = vec![dicts::model_info(f).1.to_string(), format!("macOS 版 3.0.1 · {}", dicts::size_text(*size))];
+                    let status = if on { ("使用中", GREEN) } else { ("整句候选已关", TEXT2) };
+                    e2e_card = e2e_card.child(dict_row("icons/cpu.svg", model_title(f), meta, Some(status), div(), i + 1 < files.len()));
+                }
+            } else {
+                e2e_card = e2e_card.child(
+                    div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("还没有下载整句模型：在终端运行 minime-fetch e2e，然后重启引擎。"),
+                );
+            }
         }
 
         // 引擎内置的模型（必需）

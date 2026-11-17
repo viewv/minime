@@ -3,10 +3,10 @@
 *Yet another Linux port of the WeType engine* —— 在 Linux 上原生运行微信输入法引擎的 fcitx5 输入法。
 
 > [!WARNING]
-> **测试版（0.1.1）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
+> **测试版（0.1.2）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
 > 不建议作为唯一的输入法使用。
 >
-> **Beta (0.1.1)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
+> **Beta (0.1.2)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
 > your only input method. 
 
 微信输入法官方只提供 Windows、macOS 和移动端版本。在 Linux 上使用它，常见的做法是用 Wine 运行 Windows 版、
@@ -106,76 +106,95 @@ flowchart TB
 
 ## 安装
 
-需要 x86-64 Linux、fcitx5 和 systemd。安装分两步：先安装 MinIME 本身，再用 `minime-fetch` 从腾讯官方下载引擎等文件。
+需要 x86-64 Linux、fcitx5 和 systemd。整个过程分四步：装软件包 → 把 fcitx5 设为输入法 → 运行 `minime-fetch` → 切换使用。
 
-### 1. 安装 MinIME
+### 1. 安装软件包
 
-MinIME 提供 Arch Linux、Debian / Ubuntu（deb）和 Fedora（rpm）的打包文件。软件包只包含本项目自己的程序，
-需要在目标系统上从源码构建（fcitx5 插件要按各发行版自己的 fcitx5 编译）。
+从 [Releases](https://github.com/viewv/minime/releases) 下载对应发行版的软件包（软件包只包含 MinIME 自己的程序）：
 
-| 发行版 | 软件包 | 已验证的版本 |
+| 发行版 | 文件 | 安装 |
 |---|---|---|
-| Arch Linux | PKGBUILD（`packaging/arch/`） | 滚动更新 |
-| Debian / Ubuntu | deb（`packaging/deb/build-deb.sh`） | Debian 13、Ubuntu 26.10 |
-| Fedora | rpm（`packaging/rpm/minime.spec`） | Fedora 44 |
+| Arch Linux | `minime-git-*.pkg.tar.zst` | `sudo pacman -U minime-git-*.pkg.tar.zst` |
+| Debian 13 | `minime_*debian13_amd64.deb` | `sudo apt install ./minime_*debian13_amd64.deb` |
+| Ubuntu 26.10 | `minime_*ubuntu26.10_amd64.deb` | `sudo apt install ./minime_*ubuntu26.10_amd64.deb` |
+| Fedora 44 | `minime-*.fc44.x86_64.rpm` | `sudo dnf install ./minime-*.fc44.x86_64.rpm` |
 
-以上每个版本都在全新容器里验证过完整流程：构建、打包、安装、`minime-fetch` 下载、启动引擎服务并输入全拼、双拼和五笔。
-MinIME 只支持当前的发行版：fcitx5 插件用到较新的 fcitx5 接口，fcitx5 太旧（例如 Ubuntu 24.04 自带的版本）时构建会直接报错。
+MinIME 只支持当前的发行版：fcitx5 插件用到较新的 fcitx5 接口，太旧的 fcitx5（例如 Ubuntu 24.04 自带的）不支持。
+建议同时装上 fcitx5 的配置工具和 Qt / GTK 模块（软件包会推荐安装）：Fedora 和 Arch 是
+`fcitx5-configtool fcitx5-qt fcitx5-gtk`，Debian / Ubuntu 是 `fcitx5-config-qt fcitx5-frontend-qt6 fcitx5-frontend-gtk3 fcitx5-frontend-gtk4`。
+
+<details>
+<summary>从源码构建</summary>
 
 构建需要 gcc、cmake、较新的 Rust stable（发行版自带的版本太旧时用 [rustup](https://rustup.rs) 安装）、
 fcitx5 的开发文件、shaderc（`glslc`）和 Vulkan 头文件；构建时 cargo 需要联网下载依赖。各发行版的依赖包名见
 [packaging](docs/packaging.md)。
 
-**Arch Linux**
-
 ```bash
+# Arch Linux
 cd packaging/arch && makepkg -si
-```
-
-**Debian / Ubuntu**
-
-```bash
-make
-packaging/deb/build-deb.sh
-sudo apt install ./dist/minime_*.deb
-```
-
-**Fedora**
-
-```bash
+# Debian / Ubuntu
+make && packaging/deb/build-deb.sh && sudo apt install ./dist/minime_*.deb
+# Fedora
 mkdir -p ~/rpmbuild/SOURCES
 git archive --prefix=minime-$(cat VERSION)/ -o ~/rpmbuild/SOURCES/minime-$(cat VERSION).tar.gz HEAD
-rpmbuild -bb packaging/rpm/minime.spec
-sudo dnf install ~/rpmbuild/RPMS/x86_64/minime-*.rpm
+rpmbuild -bb packaging/rpm/minime.spec && sudo dnf install ~/rpmbuild/RPMS/x86_64/minime-*.rpm
+# 其他发行版（运行时需要 fcitx5、jemalloc、python3、7z 和 curl）
+make && sudo make install PREFIX=/usr
 ```
 
-**其他发行版**：直接安装到系统目录（运行时需要 fcitx5、jemalloc、python3、7z 和 curl）。
+</details>
+
+### 2. 把 fcitx5 设为输入法
+
+- **KDE Plasma（Wayland）**：「系统设置 → 键盘 → 虚拟键盘」里选择 **Fcitx 5**，然后注销重新登录。
+  KDE 上不需要设置 `GTK_IM_MODULE`、`QT_IM_MODULE` 这类环境变量，也不要装 Fedora 的 `fcitx5-autostart`
+  （装了 fcitx5 会弹出环境变量的警告）；不要手动启动 fcitx5，它必须由 KWin 启动。
+- **其他桌面**：Debian / Ubuntu 运行 `im-config -n fcitx5`，Fedora 安装 `fcitx5-autostart`，Arch 见
+  [ArchWiki：Fcitx5](https://wiki.archlinux.org/title/Fcitx5)，然后注销重新登录。
+  GNOME 还需要安装「Input Method Panel」扩展才能显示候选框。（GNOME 上还没有充分测试。）
+
+登录后托盘里出现键盘图标，就说明 fcitx5 在运行了。
+
+### 3. 运行 `minime-fetch`
+
+以普通用户身份运行（不要加 sudo）：
 
 ```bash
-make
-sudo make install PREFIX=/usr
-```
-
-### 2. 下载官方文件并启动
-
-以下命令都以普通用户身份运行（不要加 sudo）：
-
-```bash
-# 从腾讯官方下载引擎、词库（约 218 MB）和整句模型（约 78 MB），校验后解包到 ~/.local/share/minime/official/
 minime-fetch
-# 可选：离线语音模型（约 100 MB）
-minime-fetch voice
-
-# 引擎服务
-systemctl --user enable --now minime-engined
-# 可选：网络服务（跨设备同步，默认不联网）和离线语音
-systemctl --user enable --now minime-netd minime-asrd.socket
-
-# 重启 fcitx5，然后在 fcitx5 配置里添加「MinIME」
-fcitx5 -r -d
 ```
 
-`minime-fetch status` 可以查看已经下载了哪些文件。
+它会依次：
+
+1. 从腾讯官方下载引擎和词库（约 218 MB）、整句模型（约 78 MB），校验后解包到 `~/.local/share/minime/official/`。
+   整句模型的下载服务器比较慢，可能要几分钟，下载时会显示进度；
+2. 启用并启动引擎服务 `minime-engined`；
+3. 把 MinIME 加进 fcitx5 的输入法列表。
+
+可选功能：
+
+```bash
+minime-fetch voice                              # 离线语音（约 103 MB），装好后按住右 Alt 说话
+systemctl --user enable --now minime-netd       # 跨设备和云输入；之后在「MinIME 设置 → 跨设备」里打开联网
+```
+
+`minime-fetch status` 查看下载了哪些文件；`minime-fetch setup` 只重做第 2、3 步（例如升级之后）。
+
+### 4. 开始使用
+
+在任意输入框里按 **Ctrl+Space** 切换到 MinIME（托盘图标变成 **M**），就可以打字了。
+可以打一句长句试试整句候选，例如 `tabashoujiwangzaichuzucheshangle`，候选里带 ✦ 的「他把手机忘在出租车上了」
+就是整句模型给的。设置在应用菜单的「MinIME 设置」里。
+
+### 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 托盘里只有键盘，Ctrl+Space 切不到 MinIME | 运行 `minime-fetch setup` 把 MinIME 加进列表；或在 fcitx5 配置里添加，系统是英文时要先取消勾选「Only Show Current Language」（MinIME 是中文输入法，默认被筛掉） |
+| 切到了 MinIME，但打字没有候选框 | 引擎服务没在运行：`minime-fetch status` 确认引擎已下载，再运行 `minime-fetch setup`；日志：`journalctl --user -u minime-engined -b` |
+| 没有 ✦ 整句候选 | `minime-fetch status` 确认整句模型已下载，然后 `minime-fetch setup` 重启引擎。整句候选只在输入较长、和引擎首选不同时出现 |
+| fcitx5 弹出 `GTK_IM_MODULE` / `QT_IM_MODULE` 的警告（KDE） | 卸载 `fcitx5-autostart`，或去掉自己设置的这两个环境变量，注销重新登录 |
+| 跨设备显示「official files missing」 | 先运行 `minime-fetch`：联网功能要用下载的官方文件 |
 
 ### 官方文件的版本是固定的
 
@@ -191,10 +210,6 @@ MinIME 和官方引擎之间的适配（引擎接口、会话配置、装载时�
 官方发布新版本不会影响 MinIME：已经下载的文件一直可用，新版本要等 MinIME 验证适配后才会切换。
 如果官方以后撤下了这些下载地址，可以用自己保存的安装包离线安装：
 `minime-fetch engine --from WeTypeSetup_3.0.1.35_3.exe`。
-
-> **KDE Plasma（Wayland）**：fcitx5 由 KWin 启动，不要用上面的 `fcitx5 -r -d` 手动启动，否则输入法无法正常工作。
-> 请在「系统设置 → 键盘 → 虚拟键盘」里重新选择一次 Fcitx 5；从源码目录也可以运行 `scripts/restart_fcitx5.sh`，
-> 它让 KWin 重新拉起 fcitx5，大约需要 15 秒。
 
 ## 使用
 

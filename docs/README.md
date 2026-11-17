@@ -13,4 +13,4 @@
 | [packaging](packaging.md) | 打包和安装布局（Arch、Debian / Ubuntu、Fedora） |
 | [development](development.md) | 开发：构建、测试工具、调试开关、代码结构 |
 
-MinIME 目前是测试版，文档描述的是 0.1.1 的行为，可能随版本变化。
+MinIME 目前是测试版，文档描述的是 0.1.2 的行为，可能随版本变化。

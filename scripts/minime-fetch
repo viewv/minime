@@ -12,17 +12,22 @@ MinIME 的仓库和软件包都不包含腾讯的文件；每个用户用这个�
   minime-fetch all             再加上语音模型
   minime-fetch engine|e2e|voice ...
   minime-fetch status          看看装了哪些
+  minime-fetch setup           只做下载后的配置：启用并重启引擎服务、把 MinIME 加进 fcitx5 的输入法列表
   minime-fetch engine --from WeTypeSetup_3.0.1.35_3.exe   用已经下载好的安装包
+
+下载完成后会自动做 setup 那一步（加 --no-setup 跳过）。
 
 文件放在 $XDG_DATA_HOME/minime/official/（缺省 ~/.local/share/minime/official/）。只依赖 python3 和 7z。
 """
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 import zlib
@@ -72,21 +77,45 @@ def file_hash(path, algo):
     return h.hexdigest()
 
 
+class Progress:
+    """下载进度：终端里原地刷新一行（MB、百分比、速度），不是终端时每 16 MB 打一行。"""
+
+    def __init__(self, total):
+        self.total, self.done, self.t0, self.last = total, 0, time.time(), 0
+        self.tty = sys.stdout.isatty()
+
+    def add(self, n):
+        self.done += n
+        if self.tty or self.done - self.last >= 16 * CHUNK:
+            self.last = self.done
+            self.show()
+
+    def show(self, end=False):
+        speed = self.done / max(time.time() - self.t0, 0.001) / (1 << 20)
+        pct = " %3d%%" % (self.done * 100 // self.total) if self.total else ""
+        line = "  %6.1f / %.1f MB%s  %.1f MB/s" % (self.done / (1 << 20), self.total / (1 << 20), pct, speed)
+        if self.tty:
+            sys.stdout.write("\r" + line + ("\n" if end else ""))
+            sys.stdout.flush()
+        elif end or self.done - self.last == 0:
+            print(line, flush=True)
+
+    def finish(self):
+        self.show(end=True)
+
+
 def download(url, dest):
     part = dest + ".part"
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = last = 0
+        bar = Progress(int(resp.headers.get("Content-Length") or 0))
         while True:
             block = resp.read(CHUNK)
             if not block:
                 break
             out.write(block)
-            done += len(block)
-            if total and done - last >= 16 * CHUNK:
-                last = done
-                say("  %d / %d MB" % (done >> 20, total >> 20))
+            bar.add(len(block))
+        bar.finish()
     os.replace(part, dest)
 
 
@@ -181,13 +210,16 @@ def fetch_member(url, info, dest):
     crc = 0
     req = urllib.request.Request(url, headers=dict(UA, Range="bytes=%d-%d" % (start, end)))
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+        bar = Progress(info.compress_size)
         while True:
             block = resp.read(CHUNK)
             if not block:
                 break
+            bar.add(len(block))
             data = dec.decompress(block) if dec else block
             crc = zlib.crc32(data, crc)
             out.write(data)
+        bar.finish()
         if dec:
             tail = dec.flush()
             crc = zlib.crc32(tail, crc)
@@ -206,13 +238,13 @@ def fetch_e2e(force=False):
     for name, md5 in MAC_FILES.items():
         dest = os.path.join(E2E_DIR, name)
         part = dest + ".part"
+        say("  %s" % name)
         fetch_member(MAC_URL, z.getinfo(MAC_DIR + name), part)
         got = file_hash(part, "md5")
         if got != md5:
             os.unlink(part)
             die("%s 的 MD5 不对：%s（应为 %s）" % (name, got, md5))
         os.replace(part, dest)
-        say("  %s" % name)
     say("整句模型：已安装到 %s" % E2E_DIR)
 
 
@@ -240,6 +272,90 @@ def fetch_voice(force=False):
     subprocess.run([b, "fetch-model"], check=True)
 
 
+# ---------------- 装好之后：启动引擎服务、把 MinIME 加进 fcitx5 ----------------
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def setup_service():
+    """启用并（重新）启动引擎服务：新下载的模型只在引擎启动时加载。"""
+    if not shutil.which("systemctl"):
+        say("提示：没有 systemctl，请自己启动 minime-engined")
+        return
+    if (r := run(["systemctl", "--user", "cat", "minime-engined"])) is None or r.returncode != 0:
+        say("提示：没有找到 minime-engined 用户服务（MinIME 的软件包装好了吗？）")
+        return
+    run(["systemctl", "--user", "enable", "minime-engined"])
+    r = run(["systemctl", "--user", "restart", "minime-engined"])
+    if r is not None and r.returncode == 0:
+        say("引擎服务：已启用并启动（minime-engined）")
+    else:
+        say("提示：引擎服务没能启动，查看 journalctl --user -u minime-engined")
+
+
+def fcitx(*args):
+    """调 fcitx5 的 D-Bus 控制接口，返回结果列表；fcitx5 没在运行时返回 None。"""
+    r = run(["busctl", "--user", "--json=short", "call", "org.fcitx.Fcitx5", "/controller",
+             "org.fcitx.Fcitx.Controller1", *args])
+    if r is None or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)["data"] if r.stdout.strip() else []
+    except ValueError:
+        return None
+
+
+def setup_fcitx5():
+    """把 MinIME 加进 fcitx5 当前的输入法分组（已经在了就不动）。"""
+    if not shutil.which("busctl") or fcitx("CurrentInputMethodGroup") is None:
+        say("提示：fcitx5 没有在运行。启用 fcitx5 后，在 fcitx5 配置里添加「MinIME」，"
+            "或者再运行一次 minime-fetch setup")
+        return
+    has = lambda: any(im[0] == "minime" for im in (fcitx("AvailableInputMethods") or [[]])[0])
+    if not has():
+        fcitx("Refresh")                       # 软件包是在 fcitx5 启动之后装的：重新扫描插件
+        time.sleep(1)
+    if not has():
+        say("提示：fcitx5 还没有加载 MinIME 插件。重新登录（或重启 fcitx5）后再运行 minime-fetch setup")
+        return
+    group = fcitx("CurrentInputMethodGroup")[0]
+    layout, items = fcitx("InputMethodGroupInfo", "s", group)
+    if any(im == "minime" for im, _ in items):
+        say("fcitx5：MinIME 已经在输入法列表里（Ctrl+Space 切换）")
+        return
+    items = items + [["minime", ""]]
+    flat = [x for it in items for x in it]
+    if fcitx("SetInputMethodGroupInfo", "ssa(ss)", group, layout, str(len(items)), *flat) is None:
+        say("提示：没能把 MinIME 加进 fcitx5，请在 fcitx5 配置里手动添加")
+        return
+    fcitx("Save")
+    say("fcitx5：已把 MinIME 加进输入法列表（Ctrl+Space 切换）")
+
+
+def setup_voice():
+    if shutil.which("systemctl") and (r := run(["systemctl", "--user", "enable", "--now", "minime-asrd.socket"])) \
+            and r.returncode == 0:
+        say("语音服务：已启用（按需启动，按住右 Alt 说话）")
+    else:
+        say("提示：语音服务没能启用，运行 systemctl --user enable --now minime-asrd.socket")
+
+
+def setup(voice=False, engine=True):
+    if not engine_ok():
+        say("引擎还没有下载，先运行 minime-fetch")
+        return 1
+    if engine:
+        setup_service()
+        setup_fcitx5()
+    if voice:
+        setup_voice()
+    return 0
+
+
 def status():
     rows = [("引擎", engine_ok(), ENGINE_DIR, "必需"), ("整句模型", e2e_ok(), E2E_DIR, "推荐"),
             ("语音模型", voice_ok(), os.path.join(data_home(), "minime", "asr", "model"), "可选")]
@@ -258,9 +374,12 @@ def main(argv):
         i = argv.index("--from")
         src = argv[i + 1] if i + 1 < len(argv) else die("--from 后面要跟安装包路径")
         argv = argv[:i] + argv[i + 2:]
+    no_setup = "--no-setup" in argv
     what = [a for a in argv if not a.startswith("--")] or ["engine", "e2e"]
     if what == ["status"]:
         return status()
+    if what == ["setup"]:
+        return setup()
     if "all" in what:
         what = ["engine", "e2e", "voice"]
     for w in what:
@@ -272,8 +391,11 @@ def main(argv):
             fetch_voice(force)
         else:
             die("不认识的参数：%s（minime-fetch --help）" % w)
-    say("完成。重启引擎生效：systemctl --user restart minime-engined")
-    return 0
+    if no_setup or not engine_ok():
+        say("完成。")
+        return 0
+    say("下载完成，接着配置：")
+    return setup(voice="voice" in what, engine="engine" in what or "e2e" in what)
 
 
 if __name__ == "__main__":

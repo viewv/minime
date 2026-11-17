@@ -36,7 +36,7 @@ Architecture: $ARCH
 Maintainer: MinIME contributors
 Installed-Size: $SIZE
 Depends: $SHLIBS, libvulkan1, libwayland-client0, libfontconfig1, fcitx5, python3, 7zip | p7zip-full, curl
-Recommends: wl-clipboard, pipewire-bin | pulseaudio-utils, mesa-vulkan-drivers
+Recommends: fcitx5-config-qt, fcitx5-frontend-qt6, fcitx5-frontend-gtk3, fcitx5-frontend-gtk4, wl-clipboard, pipewire-bin | pulseaudio-utils, mesa-vulkan-drivers
 Section: utils
 Priority: optional
 Homepage: https://github.com/viewv/minime
@@ -51,10 +51,11 @@ cat > "$STAGE/root/DEBIAN/postinst" <<'POST'
 set -e
 if [ "$1" = configure ]; then
   cat <<'MSG'
-MinIME 已安装。以普通用户身份继续（不要用 sudo）：
-  1. minime-fetch                                   从腾讯官方下载引擎和整句模型
-  2. systemctl --user enable --now minime-engined    启动引擎服务
-  3. 重启 fcitx5，在 fcitx5 配置里添加「MinIME」
+MinIME 已安装。接下来以普通用户身份运行（不要用 sudo）：
+  minime-fetch
+它会从腾讯官方下载引擎和整句模型，启动引擎服务，并把 MinIME 加进 fcitx5 的输入法列表。
+fcitx5 要先设为系统的输入法（KDE：系统设置 → 键盘 → 虚拟键盘 → Fcitx 5），然后按 Ctrl+Space 切换。
+详见 https://github.com/viewv/minime#安装
 MSG
 fi
 POST

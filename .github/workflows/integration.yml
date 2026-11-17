@@ -1,0 +1,41 @@
+name: Integration (manual)
+
+# 手动触发的真机式测试：从腾讯官方地址下载引擎和整句模型（每次都下载，不缓存），
+# 启动引擎服务测打字；勾选 network 时再用匿名设备身份测联网（netd 握手、云输入）。
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: 在哪个发行版上测
+        type: choice
+        options: [fedora, arch, debian, ubuntu]
+        default: fedora
+      network:
+        description: 联网测试（匿名设备连接服务器、云输入）
+        type: boolean
+        default: false
+
+jobs:
+  integration:
+    name: integration (${{ inputs.distro }}${{ inputs.network && ', network' || '' }})
+    runs-on: ubuntu-latest
+    container: >-
+      ${{ fromJSON('{"fedora":"registry.fedoraproject.org/fedora:44","arch":"docker.io/library/archlinux:latest","debian":"docker.io/library/debian:trixie","ubuntu":"docker.io/library/ubuntu:26.10"}')[inputs.distro] }}
+    steps:
+      - name: Install git
+        run: |
+          command -v git && exit 0
+          if command -v pacman; then pacman -Syu --noconfirm git
+          elif command -v apt-get; then apt-get update -qq && apt-get install -y -qq git ca-certificates
+          else dnf install -y -q git; fi
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          packaging/ci/deps.sh ${{ inputs.distro }}
+          if command -v pacman; then pacman -S --noconfirm --needed p7zip
+          elif command -v apt-get; then apt-get install -y -qq 7zip || apt-get install -y -qq p7zip-full
+          else dnf install -y -q 7zip || dnf install -y -q p7zip-plugins; fi
+      - name: Build engine and network service
+        run: make engined netd
+      - name: Integration test
+        run: packaging/ci/integration.sh ${{ inputs.network && '--network' || '' }}

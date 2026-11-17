@@ -3,7 +3,7 @@
 # 构建时 cargo 要联网取依赖；Rust 需要较新的 stable（发行版自带的太旧时用 rustup）。
 
 Name:           minime
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Native Linux fcitx5 input method running the WeType engine
 License:        MPL-2.0
@@ -17,7 +17,7 @@ BuildRequires:  glslc vulkan-headers jemalloc-devel
 BuildRequires:  libxkbcommon-devel libxkbcommon-x11-devel libxcb-devel wayland-devel fontconfig-devel
 Requires:       fcitx5 python3 curl vulkan-loader libwayland-client fontconfig
 Requires:       (7zip or p7zip-plugins)
-Recommends:     wl-clipboard pipewire-utils mesa-vulkan-drivers
+Recommends:     fcitx5-configtool fcitx5-qt fcitx5-gtk wl-clipboard pipewire-utils mesa-vulkan-drivers
 
 # Rust 二进制不带调试信息分包
 %global debug_package %{nil}
@@ -39,10 +39,11 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 %post
 cat <<'MSG'
-MinIME 已安装。以普通用户身份继续（不要用 sudo）：
-  1. minime-fetch                                   从腾讯官方下载引擎和整句模型
-  2. systemctl --user enable --now minime-engined    启动引擎服务
-  3. 重启 fcitx5，在 fcitx5 配置里添加「MinIME」
+MinIME 已安装。接下来以普通用户身份运行（不要用 sudo）：
+  minime-fetch
+它会从腾讯官方下载引擎和整句模型，启动引擎服务，并把 MinIME 加进 fcitx5 的输入法列表。
+fcitx5 要先设为系统的输入法（KDE：系统设置 → 键盘 → 虚拟键盘 → Fcitx 5），然后按 Ctrl+Space 切换。
+详见 https://github.com/viewv/minime#安装
 MSG
 
 %files
@@ -62,6 +63,10 @@ MSG
 %{_datadir}/applications/minime-settings.desktop
 
 %changelog
+* Tue Nov 17 2026 MinIME contributors - 0.1.2-1
+- minime-fetch now enables the engine service and adds MinIME to fcitx5 after downloading
+- Download progress; settings show the downloaded whole-sentence model
+- Recommend fcitx5 config tool and Qt/GTK frontends; protocol constants loaded from ime_net.dll
 * Mon Nov 16 2026 MinIME contributors - 0.1.1-1
 - Disable the engine's own word learning in sensitive (privacy) input fields
 
