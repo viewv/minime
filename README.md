@@ -3,10 +3,10 @@
 *Yet another Linux port of the WeType engine* —— 在 Linux 上原生运行微信输入法引擎的 fcitx5 输入法。
 
 > [!WARNING]
-> **测试版（0.1.2）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
+> **测试版（0.1.3）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
 > 不建议作为唯一的输入法使用。
 >
-> **Beta (0.1.2)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
+> **Beta (0.1.3)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
 > your only input method. 
 
 微信输入法官方只提供 Windows、macOS 和移动端版本。在 Linux 上使用它，常见的做法是用 Wine 运行 Windows 版、
@@ -195,6 +195,18 @@ systemctl --user enable --now minime-netd       # 跨设备和云输入；之后
 | 没有 ✦ 整句候选 | `minime-fetch status` 确认整句模型已下载，然后 `minime-fetch setup` 重启引擎。整句候选只在输入较长、和引擎首选不同时出现 |
 | fcitx5 弹出 `GTK_IM_MODULE` / `QT_IM_MODULE` 的警告（KDE） | 卸载 `fcitx5-autostart`，或去掉自己设置的这两个环境变量，注销重新登录 |
 | 跨设备显示「official files missing」 | 先运行 `minime-fetch`：联网功能要用下载的官方文件 |
+
+### 卸载
+
+先以普通用户身份清理 MinIME 在当前用户下的东西：停止并取消自启服务、把 MinIME 从 fcitx5 的输入法列表里去掉、
+删除下载的官方文件、用户词库和缓存（约 0.6–1 GB）。会先列出要删的内容，确认后才动手：
+
+```bash
+minime-uninstall                 # --dry-run 只列出；--keep-data 保留用户词库、常用语和设备身份
+```
+
+然后用包管理器卸载软件包（`minime-uninstall` 最后会提示对应的命令）：`sudo pacman -R minime-git`、
+`sudo apt remove minime` 或 `sudo dnf remove minime`。如果关联过手机，可以在手机的「我的设备」里解除本机。
 
 ### 官方文件的版本是固定的
 

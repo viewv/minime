@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""minime-uninstall —— 清理 MinIME 在当前用户下的东西（服务、fcitx5 设置、下载的官方文件、数据）。
+
+以普通用户身份运行（不要加 sudo）。软件包本身要用发行版的包管理器卸载，最后会提示命令。
+
+用法:
+  minime-uninstall              列出要清理的内容，确认后清理
+  minime-uninstall --keep-data  保留用户词库（学到的词）、常用语、设备身份等，只删官方文件和缓存
+  minime-uninstall --dry-run    只列出，不做任何改动
+  minime-uninstall -y           不问，直接清理
+
+会做的事：
+  1. 停止并取消自启 minime-engined、minime-netd、minime-asrd；删掉开发时装在 ~/.config/systemd/user 下的单元文件
+  2. 把 MinIME 从 fcitx5 的输入法列表里去掉
+  3. 删除 ~/.local/share/minime（官方文件、用户词库、设备身份、语音模型……）、~/.cache/minime、
+     fcitx5 里 MinIME 的配置 ~/.config/fcitx5/conf/minime.conf，以及开发安装留下的菜单项和程序
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+UNITS = ["minime-engined.service", "minime-netd.service", "minime-asrd.socket", "minime-asrd.service"]
+HOME = os.path.expanduser("~")
+
+
+def xdg(var, default):
+    return os.environ.get(var) or os.path.join(HOME, default)
+
+
+DATA = os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "minime")
+CACHE = os.path.join(xdg("XDG_CACHE_HOME", ".cache"), "minime")
+CONFIG = xdg("XDG_CONFIG_HOME", ".config")
+# 用户数据：--keep-data 时保留
+KEEP = ["userdata", "dicts", "net", "blocked_words.txt"]
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def size(path):
+    if os.path.isfile(path) or os.path.islink(path):
+        return os.path.getsize(path) if os.path.isfile(path) else 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024
+
+
+def targets(keep_data):
+    """要删的文件和目录"""
+    out = []
+    if os.path.isdir(DATA):
+        if keep_data:
+            out += [os.path.join(DATA, e) for e in sorted(os.listdir(DATA)) if e not in KEEP]
+        else:
+            out.append(DATA)
+    out.append(CACHE)
+    if not keep_data:
+        out.append(os.path.join(CONFIG, "fcitx5/conf/minime.conf"))
+    # 开发时 scripts/install_*.sh 装的
+    out += [os.path.join(CONFIG, "systemd/user", u) for u in UNITS]
+    out.append(os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "applications/minime-settings.desktop"))
+    out += [os.path.join(HOME, ".local/bin", b) for b in ("minime-settings", "minime-netd", "minime-asrd")]
+    return [p for p in out if os.path.lexists(p)]
+
+
+def fcitx(*args):
+    r = run(["busctl", "--user", "--json=short", "call", "org.fcitx.Fcitx5", "/controller",
+             "org.fcitx.Fcitx.Controller1", *args])
+    if r is None or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)["data"] if r.stdout.strip() else []
+    except ValueError:
+        return None
+
+
+def remove_from_fcitx5(dry):
+    """把 MinIME 从 fcitx5 的各个输入法分组里去掉；返回说明文字"""
+    if not shutil.which("busctl") or (groups := fcitx("InputMethodGroups")) is None:
+        return "fcitx5 没在运行，跳过（输入法列表里的 MinIME 下次启动 fcitx5 时会因为插件不在而消失）"
+    changed = []
+    for group in groups[0]:
+        layout, items = fcitx("InputMethodGroupInfo", "s", group)
+        rest = [it for it in items if it[0] != "minime"]
+        if len(rest) == len(items):
+            continue
+        changed.append(group)
+        if not dry:
+            flat = [x for it in rest for x in it]
+            fcitx("SetInputMethodGroupInfo", "ssa(ss)", group, layout, str(len(rest)), *flat)
+    if changed and not dry:
+        fcitx("Save")
+    return ("从输入法分组 %s 里去掉 MinIME" % "、".join(changed)) if changed else "fcitx5 的输入法列表里没有 MinIME"
+
+
+def stop_services(dry):
+    if not shutil.which("systemctl"):
+        return []
+    done = []
+    for u in UNITS:
+        r = run(["systemctl", "--user", "is-enabled", u])
+        a = run(["systemctl", "--user", "is-active", u])
+        enabled = r is not None and r.stdout.strip() in ("enabled", "enabled-runtime", "linked")
+        active = a is not None and a.stdout.strip() in ("active", "activating", "reloading")
+        if enabled or active:
+            done.append(u)
+            if not dry:
+                run(["systemctl", "--user", "disable", "--now", u])
+    return done
+
+
+def package_hint():
+    if shutil.which("pacman") and (r := run(["pacman", "-Q", "minime-git"])) and r.returncode == 0:
+        return "sudo pacman -R minime-git"
+    if shutil.which("dpkg-query") and (r := run(["dpkg-query", "-W", "minime"])) and r.returncode == 0:
+        return "sudo apt remove minime"
+    if shutil.which("rpm") and (r := run(["rpm", "-q", "minime"])) and r.returncode == 0:
+        return "sudo dnf remove minime"
+    if os.path.exists("/usr/bin/minime-engined"):
+        return "（用安装时的方式卸载 /usr 下的 MinIME 程序，例如在源码目录运行 sudo make uninstall）"
+    return None
+
+
+def main(argv):
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__)
+        return 0
+    if os.geteuid() == 0:
+        print("请以普通用户身份运行（不要加 sudo）：清理的是当前用户的服务和数据。", file=sys.stderr)
+        return 1
+    dry = "--dry-run" in argv
+    keep = "--keep-data" in argv
+    yes = "-y" in argv or "--yes" in argv
+
+    files = targets(keep)
+    units = stop_services(dry=True)
+    print("MinIME 卸载清理%s：" % ("（只列出，不改动）" if dry else ""))
+    print("  服务：%s" % ("、".join(units) if units else "没有在运行或启用的"))
+    print("  fcitx5：%s" % remove_from_fcitx5(dry=True))
+    if files:
+        print("  删除：")
+        for p in files:
+            print("    %-60s %s" % (p, human(size(p))))
+        print("  合计 %s" % human(sum(size(p) for p in files)))
+    else:
+        print("  删除：没有要删的文件")
+    if keep:
+        print("  保留：用户词库、常用语、设备身份等（%s 下的 %s）" % (DATA, "、".join(KEEP)))
+    if os.path.exists(os.path.join(DATA, "net/identity.json")) and not keep:
+        print("  提示：如果关联过手机，本机还会留在手机「我的设备」里，可以在手机上解除")
+
+    if dry:
+        return 0
+    if not yes:
+        try:
+            if input("确认清理？[y/N] ").strip().lower() not in ("y", "yes"):
+                print("没有做任何改动。")
+                return 1
+        except EOFError:
+            print("没有做任何改动。")
+            return 1
+
+    stop_services(dry=False)
+    print(remove_from_fcitx5(dry=False))
+    for p in files:
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        except OSError as e:
+            print("  删不掉 %s：%s" % (p, e))
+    if shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"])
+    print("已清理。")
+    if hint := package_hint():
+        print("最后卸载软件包：%s" % hint)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

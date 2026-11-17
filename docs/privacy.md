@@ -51,10 +51,16 @@
 
 ## 删除数据
 
+`minime-uninstall` 会停止 MinIME 的服务，并删除它在当前用户下的全部数据：用户词库（学习结果）、
+设备身份、常用语、换机助手的备份、下载的官方文件和缓存。先运行 `minime-uninstall --dry-run` 可以看到会删哪些。
+
+只想清空某一部分时，先停服务再删对应的目录：
+
 ```bash
 systemctl --user stop minime-engined minime-netd
 rm -rf ~/.local/share/minime/userdata     # 用户词库（学习结果）
 rm -rf ~/.local/share/minime/net          # 设备身份、常用语、迁移备份
 ```
 
-删除设备身份后，再次开启联网会生成新的匿名身份，需要重新关联设备。
+删除设备身份后，再次开启联网会生成新的匿名身份，需要重新关联设备。如果关联过手机，本机还会留在手机的
+「我的设备」里，可以在手机上解除。

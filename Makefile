@@ -18,7 +18,7 @@ CARGOFLAGS ?= --release --locked
 
 ADDON_BUILD := fcitx5-minime/build
 
-.PHONY: all engined addon netd settings asrd install clean
+.PHONY: all engined addon netd settings asrd install uninstall clean
 
 all: engined addon netd settings asrd
 
@@ -44,6 +44,7 @@ install:
 	install -Dm755 settings/target/release/minime-settings $(DESTDIR)$(BINDIR)/minime-settings
 	install -Dm755 asrd/target/release/minime-asrd $(DESTDIR)$(BINDIR)/minime-asrd
 	install -Dm755 scripts/minime-fetch            $(DESTDIR)$(BINDIR)/minime-fetch
+	install -Dm755 scripts/minime-uninstall        $(DESTDIR)$(BINDIR)/minime-uninstall
 	install -Dm755 $(ADDON_BUILD)/libminime.so     $(DESTDIR)$(FCITX5LIBDIR)/libminime.so
 	install -Dm644 fcitx5-minime/minime-addon.conf $(DESTDIR)$(DATADIR)/fcitx5/addon/minime.conf
 	sed -i 's|^Library=.*|Library=libminime|'      $(DESTDIR)$(DATADIR)/fcitx5/addon/minime.conf
@@ -52,6 +53,17 @@ install:
 		packaging/systemd/minime-netd.service packaging/systemd/minime-asrd.service packaging/systemd/minime-asrd.socket
 	install -Dm644 packaging/minime-settings.desktop $(DESTDIR)$(DATADIR)/applications/minime-settings.desktop
 	install -Dm644 LICENSE                         $(DESTDIR)$(DATADIR)/licenses/minime/LICENSE
+
+# 删掉 make install 装的文件（每个用户自己的服务和数据用 minime-uninstall 清理）
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/minime-engined $(DESTDIR)$(BINDIR)/minime-netd $(DESTDIR)$(BINDIR)/minime-settings \
+		$(DESTDIR)$(BINDIR)/minime-asrd $(DESTDIR)$(BINDIR)/minime-fetch $(DESTDIR)$(BINDIR)/minime-uninstall
+	rm -f $(DESTDIR)$(FCITX5LIBDIR)/libminime.so $(DESTDIR)$(DATADIR)/fcitx5/addon/minime.conf \
+		$(DESTDIR)$(DATADIR)/fcitx5/inputmethod/minime.conf
+	rm -f $(DESTDIR)$(USERUNITDIR)/minime-engined.service $(DESTDIR)$(USERUNITDIR)/minime-netd.service \
+		$(DESTDIR)$(USERUNITDIR)/minime-asrd.service $(DESTDIR)$(USERUNITDIR)/minime-asrd.socket
+	rm -f $(DESTDIR)$(DATADIR)/applications/minime-settings.desktop
+	rm -rf $(DESTDIR)$(DATADIR)/licenses/minime
 
 clean:
 	rm -rf build/native $(ADDON_BUILD)

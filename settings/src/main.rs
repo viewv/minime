@@ -2185,7 +2185,11 @@ fn dict_row(
 }
 
 impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // GNOME 等不替程序画标题栏的桌面（客户端装饰）：自己画标题栏（关闭、最小化、最大化、拖动）
+        // 和窗口边框（阴影、拖边改大小）。KDE 由 KWin 画（服务端装饰），这里什么都不加。
+        let csd = matches!(window.window_decorations(), Decorations::Client { .. });
+        let radii = gpui_kit::component::window_corner_radii(window, cx);
         let (title, content) = match self.page {
             Page::Input => ("输入", self.page_input(cx)),
             Page::Devices => ("跨设备", self.page_devices(cx)),
@@ -2246,10 +2250,14 @@ impl Render for Settings {
             None
         };
         let toast_bottom = if pill.is_some() { 84. } else { 24. };
-        div()
-            .size_full()
+        let body = div()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .bg(rgb(PAGE_BG))
+            .rounded_bl(radii.bottom_left)
+            .rounded_br(radii.bottom_right)
             .font_family(self.ui_font.clone())
             .child(self.sidebar(cx))
             .child(
@@ -2280,7 +2288,21 @@ impl Render for Settings {
                             .child(msg),
                     ),
                 )
-            })
+            });
+        window_border().child(
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .when(csd, |d| {
+                    d.child(
+                        TitleBar::new().child(
+                            div().text_size(px(13.)).text_color(rgb(TEXT)).font_family(self.ui_font.clone()).child("MinIME 设置"),
+                        ),
+                    )
+                })
+                .child(body),
+        )
     }
 }
 
@@ -2324,6 +2346,8 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions { title: Some("MinIME 设置".into()), ..Default::default() }),
                 app_id: Some("minime-settings".into()),
+                // 调试：MINIME_SETTINGS_CSD=1 要求客户端装饰（在 KDE 上也能看到 GNOME 下的标题栏）
+                window_decorations: std::env::var_os("MINIME_SETTINGS_CSD").map(|_| WindowDecorations::Client),
                 window_min_size: Some(size(px(760.), px(520.))),
                 ..Default::default()
             },

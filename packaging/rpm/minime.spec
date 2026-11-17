@@ -3,7 +3,7 @@
 # 构建时 cargo 要联网取依赖；Rust 需要较新的 stable（发行版自带的太旧时用 rustup）。
 
 Name:           minime
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Native Linux fcitx5 input method running the WeType engine
 License:        MPL-2.0
@@ -53,6 +53,7 @@ MSG
 %{_bindir}/minime-settings
 %{_bindir}/minime-asrd
 %{_bindir}/minime-fetch
+%{_bindir}/minime-uninstall
 %{_libdir}/fcitx5/libminime.so
 %{_datadir}/fcitx5/addon/minime.conf
 %{_datadir}/fcitx5/inputmethod/minime.conf
@@ -63,6 +64,9 @@ MSG
 %{_datadir}/applications/minime-settings.desktop
 
 %changelog
+* Tue Nov 17 2026 MinIME contributors - 0.1.3-1
+- Add minime-uninstall (per-user cleanup) and make uninstall
+- Settings app draws its own title bar on desktops without server-side decorations (GNOME)
 * Tue Nov 17 2026 MinIME contributors - 0.1.2-1
 - minime-fetch now enables the engine service and adds MinIME to fcitx5 after downloading
 - Download progress; settings show the downloaded whole-sentence model

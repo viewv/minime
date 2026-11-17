@@ -10,6 +10,7 @@ MinIME 的软件包**只包含本项目自己的程序**。腾讯的官方文件
 | `/usr/bin/minime-engined` | 引擎服务（`src/` 的 `build/native/engined`） |
 | `/usr/bin/minime-netd`、`minime-asrd`、`minime-settings` | 网络服务、离线语音、设置程序（Rust） |
 | `/usr/bin/minime-fetch` | 下载官方文件（`scripts/minime-fetch`，Python 标准库 + 7z） |
+| `/usr/bin/minime-uninstall` | 清理当前用户的服务、fcitx5 设置和数据（`scripts/minime-uninstall`）；`make uninstall` 删掉 `make install` 装的文件 |
 | `/usr/lib/fcitx5/libminime.so`、`/usr/share/fcitx5/{addon,inputmethod}/minime.conf` | fcitx5 插件 |
 | `/usr/lib/systemd/user/minime-*.{service,socket}` | 用户服务（`packaging/systemd/`），由用户自己 `systemctl --user enable` |
 | `/usr/share/applications/minime-settings.desktop` | 设置程序的菜单项 |
