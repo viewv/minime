@@ -1,0 +1,25 @@
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// 每个工作组一行：dst[r] = LN(src[row0 + r]) * w + b（w、b 是 W 里的 fp32）
+layout(push_constant) uniform P { uint src, row0, dst, wo, bo; } pc;
+shared float red[256];
+void main() {
+    uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x;
+    uint s = pc.src + (pc.row0 + r) * H;
+    float v0 = act[s + t], v1 = act[s + t + 256u], v2 = act[s + t + 512u];
+    red[t] = v0 + v1 + v2;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1) { if (t < k) red[t] += red[t + k]; barrier(); }
+    float mean = red[0] / float(H);
+    barrier();
+    float d0 = v0 - mean, d1 = v1 - mean, d2 = v2 - mean;
+    red[t] = d0 * d0 + d1 * d1 + d2 * d2;
+    barrier();
+    for (uint k = 128u; k > 0u; k >>= 1) { if (t < k) red[t] += red[t + k]; barrier(); }
+    float inv = inversesqrt(red[0] / float(H) + 1e-5);
+    uint d = pc.dst + r * H;
+    act[d + t]        = d0 * inv * wF32(pc.wo + t)        + wF32(pc.bo + t);
+    act[d + t + 256u] = d1 * inv * wF32(pc.wo + t + 256u) + wF32(pc.bo + t + 256u);
+    act[d + t + 512u] = d2 * inv * wF32(pc.wo + t + 512u) + wF32(pc.bo + t + 512u);
+}

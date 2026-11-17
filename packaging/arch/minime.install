@@ -1,0 +1,15 @@
+post_install() {
+  cat <<'MSG'
+==> MinIME 已安装。还需要几步（以普通用户身份运行，不要用 sudo）：
+    1. 从腾讯官方下载引擎和整句模型：    minime-fetch
+       （可选）离线语音模型：            minime-fetch voice
+    2. 启动服务：  systemctl --user enable --now minime-engined
+       可选：      systemctl --user enable --now minime-netd minime-asrd.socket
+    3. 重启 fcitx5，在 fcitx5 配置里添加「MinIME」。
+       KDE Plasma（Wayland）上请在「系统设置 → 键盘 → 虚拟键盘」里重新选择 Fcitx 5。
+MSG
+}
+
+post_upgrade() {
+  echo "==> MinIME 已更新：systemctl --user restart minime-engined，并重启 fcitx5 生效"
+}

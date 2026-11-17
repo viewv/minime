@@ -1,0 +1,13 @@
+[Unit]
+Description=MinIME 输入法引擎
+# 官方引擎要先用 minime-fetch 下载；没下载时服务以 2 退出，不反复重启
+After=graphical-session-pre.target
+
+[Service]
+ExecStart=/usr/bin/minime-engined
+Restart=on-failure
+RestartSec=1
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=default.target

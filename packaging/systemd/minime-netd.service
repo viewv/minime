@@ -1,0 +1,11 @@
+[Unit]
+Description=MinIME 网络服务（跨设备同步，默认不联网）
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/minime-netd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,205 @@
+# 由 scripts/e2e_evalset.py 生成的简拼评测集：类别	首字母简拼	声母简拼（zh/ch/sh 两个字母）	正确结果	光标前文字
+短词	nh	nh	你好	
+短词	xx	xx	谢谢	
+短词	zw	zhw	中文	
+短词	srf	shrf	输入法	
+短词	wx	wx	微信	
+短词	zd	zhd	知道	
+短词	mt	mt	明天	
+短词	py	py	朋友	
+短词	gz	gz	工作	
+短词	xx	xx	学习	
+短词	dn	dn	电脑	
+短词	sj	shj	手机	
+短词	bj	bj	北京	
+短词	sh	shh	上海	
+短词	my	my	没有	
+短词	ky	ky	可以	
+短词	wsm	wshm	为什么	
+短词	zmy	zmy	怎么样	
+短词	bkq	bkq	不客气	
+短词	dbq	dbq	对不起	
+短词	xh	xh	喜欢	
+短词	cf	chf	吃饭	
+短词	sj	shj	睡觉	
+短词	kh	kh	开会	
+短词	xb	xb	下班	
+短词	zm	zhm	周末	
+短词	jb	jb	加班	
+短词	kd	kd	快递	
+短词	dt	dt	地铁	
+短词	yy	yy	医院	
+短词	ls	lsh	老师	
+短词	tx	tx	同学	
+短词	hhh	hhh	哈哈哈	
+短词	hd	hd	好的	
+短词	sd	shd	收到	
+短词	xkl	xkl	辛苦了	
+短词	wa	wa	晚安	
+短词	zsh	zshh	早上好	
+短词	srkl	shrkl	生日快乐	
+短词	xnkl	xnkl	新年快乐	
+短词	mwt	mwt	没问题	
+短词	msd	mshd	马上到	
+短词	dyx	dyx	等一下	
+短词	bhys	bhys	不好意思	
+短词	fwq	fwq	服务器	
+短词	sjk	shjk	数据库	
+短词	byq	byq	编译器	
+短词	xk	xk	显卡	
+短词	nc	nc	内存	
+短词	czxt	czxt	操作系统	
+短语	wmsjd	wmshjd	我马上就到	
+短语	jtydl	jtydl	今天有点累	
+短语	ncflm	nchflm	你吃饭了吗	
+短语	mtj	mtj	明天见	
+短语	wsyqcfb	wshyqchfb	晚上一起吃饭吧	
+短语	wgxb	wgxb	我刚下班	
+短语	zgzmykm	zhgzhmykm	这个周末有空吗	
+短语	lszyaq	lshzhyaq	路上注意安全	
+短语	wzkh	wzkh	我在开会	
+短语	sdyxwkk	shdyxwkk	稍等一下我看看	
+短语	zgjgtgl	zhgjgtgl	这个价格太贵了	
+短语	wmjdcf	wmjdchf	我们几点出发	
+短语	bwdbkf	bwdbkf	帮我带杯咖啡	
+短语	kdfmkjx	kdfmkjx	快递放门口就行	
+短语	wyjtjl	wyjtjl	我已经提交了	
+短语	dmyjhbl	dmyjhbl	代码已经合并了	
+短语	fwqygl	fwqygl	服务器又挂了	
+短语	zgxqbhl	zhgxqbhl	这个需求不合理	
+短语	mtswsdkh	mtshwshdkh	明天上午十点开会	
+短语	wqjyt	wqjyt	我请假一天	
+短语	nnbwlhm	nnbwlhm	你那边网络好吗	
+短语	wjfnyxl	wjfnyxl	文件发你邮箱了	
+短语	mfnkyx	mfnkyx	麻烦你看一下	
+短语	wjdky	wjdky	我觉得可以	
+短语	xzyb	xzhyb	先这样吧	
+短语	ykzl	ykzl	有空再聊	
+短语	hjbj	hjbj	好久不见	
+短语	zjzmy	zjzmy	最近怎么样	
+短语	tqylyll	tqylyll	天气越来越冷了	
+短语	jddcdyf	jddchdyf	记得多穿点衣服	
+短语	wzdts	wzdtsh	我在地铁上	
+短语	sjkmdl	shjkmdl	手机快没电了	
+短语	wdgnhdh	wdgnhdh	晚点给你回电话	
+短语	wbtsf	wbtshf	我不太舒服	
+短语	qyykkb	qyykkb	去医院看看吧	
+短语	zdtzmz	zhdtzmz	这道题怎么做	
+短语	kskdzmy	kshkdzmy	考试考得怎么样	
+短语	zwzqjbg	zhwzhqjbg	周五之前交报告	
+短语	zjddchhc	zhjddchhch	这家店的菜很好吃	
+短语	wmdcqb	wmdchqb	我们打车去吧	
+短语	dyjdks	dyjdksh	电影几点开始	
+短语	pyjmhl	pyjmhl	票已经买好了	
+短语	ncbgyl	ncbgyl	内存不够用了	
+短语	xkqdzhl	xkqdzhhl	显卡驱动装好了	
+短语	cqyxss	chqyxshsh	重启一下试试	
+短语	rzlmybc	rzhlmybc	日志里没有报错	
+短语	zghsywt	zhghshywt	这个函数有问题	
+短语	csqbtgl	cshqbtgl	测试全部通过了	
+短语	bbhygyx	bbhygyx	版本号要改一下	
+短语	xzsdhm	xzsdhm	下载速度很慢	
+长句	jttqzbcwmyqcqwb	jttqzhbcwmyqchqwb	今天天气真不错我们一起出去玩吧	
+长句	wxqwnxzgwtzmjj	wxqwnxzhgwtzmjj	我想请问你下这个问题怎么解决	
+长句	tstmtbnlcjhyl	tshtmtbnlcjhyl	他说他明天不能来参加会议了	
+长句	qbwbzfwjfgzjl	qbwbzhfwjfgzhjl	请帮我把这份文件发给张经理	
+长句	wmxyzxzyzqwczgrw	wmxyzxzhyzhqwchzhgrw	我们需要在下周一之前完成这个任务	
+长句	ywxysybstcdlmt	ywxysybstchdlmt	因为下雨所以比赛推迟到了明天	
+长句	sysdjghllycbtyz	shyshdjghllycbtyzh	实验室的结果和理论预测不太一致	
+长句	jqxxdmxxydldsjlxl	jqxxdmxxydldshjlxl	机器学习的模型需要大量的数据来训练	
+长句	tdyjhwdyjjbyz	tdyjhwdyjjbyzh	他的意见和我的意见基本一致	
+长句	xzsxwsdesf	xzshxwsdeshf	现在是下午三点二十分	
+长句	wgczlskdyzhkadxm	wgczlshkdyzhhkadxm	我刚才在路上看到一只很可爱的小猫	
+长句	zgzmwdsdhzqgyw	zhgzhmwdsdhzqgyw	这个周末我打算带孩子去公园玩	
+长句	nnbnbwcyxmtdhb	nnbnbwchyxmtdhb	你能不能帮我查一下明天的航班	
+长句	wjdzgfahxyztlyx	wjdzhgfahxyztlyx	我觉得这个方案还需要再讨论一下	
+长句	qdjzzwzqbclzbh	qdjzzhwzhqbclzhbh	请大家在周五之前把材料准备好	
+长句	zbswyjklsblhshxh	zhbshwyjklsblhshhxh	这本书我已经看了三遍了还是很喜欢	
+长句	wmgsxgyybdxdbgl	wmgsxgyybdxdbgl	我们公司下个月要搬到新的办公楼	
+长句	tmtzsldqcqpb	tmtzshldqchqpb	他每天早上六点起床去跑步	
+长句	rgmtxydhwmjgtzq	rgmtxydhwmjgtzq	如果明天下雨的话我们就改天再去	
+长句	zjctdfwtdfch	zhjctdfwtdfchh	这家餐厅的服务态度非常好	
+长句	wmmrwzmhjcf	wmmrwzhmhjchf	我妈妈让我周末回家吃饭	
+长句	xldtsrhhyhzy	xldtshrhhyhzhy	新来的同事人很好也很专业	
+长句	zcksdtmbscndl	zhckshdtmbshcndl	这次考试的题目比上次难多了	
+长句	wyjbhyjyfdqll	wyjbhyjyfdqll	我已经把会议纪要发到群里了	
+长句	mfnbztdsjzhdyb	mfnbztdshjzhdyb	麻烦你把昨天的数据再核对一遍	
+长句	zgwtwmzqyjtlgl	zhgwtwmzhqyjtlgl	这个问题我们之前已经讨论过了	
+长句	wmdcpxgjdjysxl	wmdchpxgjdjyshxl	我们的产品下个季度就要上线了	
+长句	yhfkszggnbthy	yhfkshzhggnbthy	用户反馈说这个功能不太好用	
+长句	nxbhjdhrhzpyxcs	nxbhjdhrhzpyxcsh	你先把环境搭好然后再跑一下测试	
+长句	zddmdxnhyhddtskj	zhddmdxnhyhddtshkj	这段代码的性能还有很大的提升空间	
+长句	wmkyyhcljssjkdyl	wmkyyhcljshshjkdyl	我们可以用缓存来减少数据库的压力	
+长句	zgjkdfhzhwdlxdbyy	zhgjkdfhzhhwdlxdbyy	这个接口的返回值和文档里写的不一样	
+长句	sjxtzhsrfjbnyl	shjxtzhhshrfjbnyl	升级系统之后输入法就不能用了	
+长句	wzwsmddxdxzhmd	wzwshmddxdxzhmd	我在网上买的东西到现在还没到	
+长句	zmdshwxhzjkdy	zhmdshhwxhzjkdy	周末的时候我喜欢在家看电影	
+长句	tswdxshzhdpy	tshwdxshhzhdpy	他是我大学时候最好的朋友	
+长句	wmyhlxzsyqqps	wmyhlxzhsyqqpsh	我们约好了下周三一起去爬山	
+长句	zjyfdyswbtxh	zhjyfdyswbtxh	这件衣服的颜色我不太喜欢	
+长句	nmnbxzjdl	nmnbxzjdl	你们那边现在几点了	
+长句	wxgyyqshccygxq	wxgyyqshhchchygxq	我下个月要去上海出差一个星期	
+长句	zgcsdjtylyfbl	zhgchshdjtylyfbl	这个城市的交通越来越方便了	
+长句	wjdnsdhydl	wjdnshdhydl	我觉得你说的很有道理	
+长句	mtdhygdxwldl	mtdhygdxwldl	明天的会议改到下午两点了	
+长句	qbmkdkdbwnjl	qbmkdkdbwnjl	请把门口的快递帮我拿进来	
+长句	hzzjxxylydd	hzzjxxylydd	孩子最近学习压力有点大	
+长句	wmxqpbxklyjcs	wmxqpbxklyjchsh	我们小区旁边新开了一家超市	
+长句	ysstxydxxjt	yshshtxydxxjt	医生说他需要多休息几天	
+长句	zbdydjjrrhyw	zhbdydjjrrhyw	这部电影的结局让人很意外	
+长句	tsgzydzwdkdwssd	tshgzhydzhwdkdwshshd	图书馆周一到周五都开到晚上十点	
+长句	wmtdzgjddmbyjwcl	wmtdzhgjddmbyjwchl	我们团队这个季度的目标已经完成了	
+长句	tbsjwzczcsl	tbshjwzchzchshl	他把手机忘在出租车上了	
+长句	zgrjdjmsjdhjj	zhgrjdjmshjdhjj	这个软件的界面设计得很简洁	
+长句	wzzxxzmyzgxgj	wzhzxxzmyzhgxgj	我正在学习怎么用这个新工具	
+长句	zclxhdqbysdlbs	zhclxhdqbysdlbsh	这次旅行花的钱比预算多了不少	
+长句	yhhzcxtzlkjdgz	yhhzhchxtzhlkjdgz	银行行长重新调整了会计的工作	
+长句	wmztlxygbbyjnxgn	wmztlxygbbyjnxgn	我们在讨论下一个版本要加哪些功能	
+长句	nbcsdxydzsyc	nbcshdxydzshyc	你把参数调小一点再试一次	
+长句	zgcwzyzgbfdshchcx	zhgcwzhyzgbfdshhchchx	这个错误只有在高并发的时候才会出现	
+长句	qjcyxpzwjdljdbd	qjchyxpzhwjdljdbd	请检查一下配置文件的路径对不对	
+长句	wyjbbdfgtml	wyjbbdfgtml	我已经把补丁发给他们了	
+上下文	jl	jl	经理	我在写一份工作报告，需要交给部门
+上下文	jl	jl	经历	这段时间的
+上下文	gs	gsh	公式	数学老师在黑板上写了一个
+上下文	gs	gsh	公事	他说今天还有
+上下文	jl	jl	精力	最近工作太多，我没有
+上下文	ql	ql	权利	每个公民都有选举的
+上下文	ql	ql	权力	他滥用了手中的
+上下文	qzks	qzhksh	期中考试	下周就是
+上下文	qz	qzh	其中	我们班有四十个人，
+上下文	sl	shl	事例	老师举了一个生动的
+上下文	sl	shl	实力	这支球队的
+上下文	sl	shl	视力	一直看手机对
+上下文	xs	xsh	形式	这次活动采用线上的
+上下文	xs	xsh	形势	目前的经济
+上下文	yc	yc	预测	天气预报的
+上下文	yd	yd	遇到	我在路上
+上下文	y	y	鱼	我们晚上做个红烧
+上下文	s	sh	树	门口种了一棵
+上下文	s	sh	书	我在图书馆借了一本
+上下文	sj	shj	数据	我们需要更多的训练
+上下文	sx	shx	熟悉	我对这个城市还不太
+上下文	cs	chsh	城市	我对这个
+上下文	gj	gj	工具	我需要一个好用的
+上下文	gj	gj	攻击	服务器受到了网络
+上下文	sj	shj	时间	我们约个
+上下文	sj	shj	事件	警察正在调查这起
+上下文	sj	shj	实践	理论要联系
+上下文	sp	shp	食品	超市里的
+上下文	sp	shp	饰品	她喜欢收集各种
+上下文	yt	yt	议题	这次会议的主要
+上下文	yt	yt	一体	我们要团结成
+上下文	cj	chj	成绩	这次考试的
+上下文	cj	chj	城际	我们坐
+上下文	ys	ys	元素	化学课上我们学了周期表里的
+上下文	hdwmsgl	hdwmshgl	好的我马上过来	你现在能来一下办公室吗？
+上下文	yjxhl	yjxhl	已经修好了	那个崩溃的问题怎么样了？
+上下文	wmtswyk	wmtshwyk	我明天上午有空	你什么时候方便？
+上下文	xxndbz	xxndbzh	谢谢你的帮助	问题已经解决了，
+上下文	wmgtzyb	wmgtzyb	我们改天再约吧	今天临时有事去不了了，
+上下文	zjl	zhjl	张经理	这份合同请交给
+上下文	lls	llsh	李老师	我们班的班主任是
+上下文	jcyxrz	jchyxrzh	检查一下日志	程序又崩溃了，先
+上下文	cxbyyb	chxbyyb	重新编译一遍	改完头文件以后要
+上下文	tjdm	tjdm	提交代码	测试都过了，可以

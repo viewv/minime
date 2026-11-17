@@ -1,0 +1,65 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "common.glsl"
+// Y[b][r] (+)= sum_c W[r][c] X[b][c] + bias[r]，W 是 int4：数据 [R/8][C/2][8] 字节（高 4 位第 2c 列，
+// 低 4 位第 2c+1 列），scale fp16 [R/8][C/32][8]，值 = (q-8)*scale。
+//
+// CL 个 32 线程簇分列算一个 8 行块，一个工作组 RB 个块；每个线程一次读 16 字节 = 4 列 × 8 行。
+// 一个工作组算 NB 个 token（特化常量，循环全部展开，累加器留在寄存器里）。
+// (q-8)·x = q·x - 8·Σx，减 8 挪到列和上做。最后簇内归约（subgroupClusteredAdd，32 宽），簇间在共享内存里相加。
+// mode：0 写入，1 累加到 Y（残差），2 写入 GELU 后的值，3 写入并把后两段（K、V）存进这一层的 KV 槽位
+layout(constant_id = 0) const uint NB = 4u;
+layout(constant_id = 1) const uint RB = 2u;      // 一个工作组几个 8 行块
+layout(constant_id = 3) const uint CL = 1u;      // 一个块由几个 32 线程簇分列来算（>1 时在共享内存里合并）
+layout(local_size_x_id = 2) in;                  // = 32 * RB * CL
+shared float red[RB * CL * NB * 8u];
+layout(push_constant) uniform P { uint R, C, q, s, bias, xoff, yoff, B, mode, l; } pc;  // q、s：uint 下标（16 字节对齐）；bias：fp16 下标（0xffffffff 没有）
+
+float gelu(float x) { return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))); }
+
+void main() {
+    uint lane = gl_LocalInvocationID.x & 31u, cl = (gl_LocalInvocationID.x >> 5) % CL, rb = gl_LocalInvocationID.x / (32u * CL);
+    uint blk = gl_WorkGroupID.x * RB + rb, lane0 = cl * 32u + lane;
+    uint b0 = gl_WorkGroupID.y * NB;
+    uint C4 = pc.C >> 2, G = pc.C >> 5;
+    bool live = blk * 8u < pc.R;                 // 整簇一起判断，不影响簇内归约
+    uint qb = (pc.q >> 2) + blk * C4, sb = (pc.s >> 2) + blk * G;
+    float acc[NB * 8u];
+    for (uint i = 0u; i < NB * 8u; i++) acc[i] = 0.0;
+    for (uint k = lane0; live && k < C4; k += 32u * CL) {
+        uvec4 q = w4[qb + k];
+        uvec4 sv = w4[sb + (k >> 3)];
+        vec4 xs[NB];                              // 先把这几列的输入全读进来，让读取并行发出
+        for (uint bb = 0u; bb < NB; bb++)         // 超出的 token 重复读最后一个（结果不写），避免分支
+            xs[bb] = act4[((pc.xoff + min(b0 + bb, pc.B - 1u) * pc.C) >> 2) + k];
+        vec2 s01 = unpackHalf2x16(sv.x), s23 = unpackHalf2x16(sv.y), s45 = unpackHalf2x16(sv.z), s67 = unpackHalf2x16(sv.w);
+        float sc[8] = float[8](s01.x, s01.y, s23.x, s23.y, s45.x, s45.y, s67.x, s67.y);
+        float sx[NB];
+        for (uint bb = 0u; bb < NB; bb++) sx[bb] = 8.0 * (xs[bb].x + xs[bb].y + xs[bb].z + xs[bb].w);
+        for (uint j = 0u; j < 8u; j++) {          // 第 j 行这 4 列的 q（0..15）
+            uint a = j < 4u ? q.x : q.y, c = j < 4u ? q.z : q.w, sh = 8u * (j & 3u);
+            vec4 wq = vec4(float((a >> (sh + 4u)) & 15u), float((a >> sh) & 15u),
+                           float((c >> (sh + 4u)) & 15u), float((c >> sh) & 15u));
+            for (uint bb = 0u; bb < NB; bb++) acc[bb * 8u + j] += sc[j] * (dot(wq, xs[bb]) - sx[bb]);
+        }
+    }
+    for (uint i = 0u; i < NB * 8u; i++) {
+        float v = subgroupClusteredAdd(acc[i], 32u);
+        if (lane == (i & 31u)) red[(rb * CL + cl) * NB * 8u + i] = v;
+    }
+    barrier();
+    for (uint o = gl_LocalInvocationID.x % (32u * CL); live && o < NB * 8u; o += 32u * CL) {   // 块内线程合并各簇
+        float v = 0.0;
+        for (uint c = 0u; c < CL; c++) v += red[(rb * CL + c) * NB * 8u + o];
+        uint bb = o >> 3, row = blk * 8u + (o & 7u);
+        if (b0 + bb >= pc.B) continue;
+        if (pc.bias != 0xffffffffu) v += wHalf(pc.bias + row);
+        uint yi = pc.yoff + (b0 + bb) * pc.R + row;
+        if (pc.mode == 1u) act[yi] += v;
+        else if (pc.mode == 2u) act[yi] = gelu(v);
+        else act[yi] = v;
+        if (pc.mode == 3u && row >= H)
+            kv[(uint(inp[IN_SLOT + b0 + bb]) * NL + pc.l) * 2u * H + row - H] = v;
+    }
+}

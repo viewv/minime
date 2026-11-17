@@ -1,0 +1,52 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "common.glsl"
+// int8 矩阵（lm_head）：数据 [R/8][C][8] 字节（有符号），scale fp16 [R/8][C/32][8]，值 = q*scale。
+// 结构同 matmul_q4：CL 个 32 线程簇一个 8 行块，每个线程一次读 16 字节 = 2 列 × 8 行，NB 个 token 一个工作组。
+layout(constant_id = 0) const uint NB = 4u;
+layout(constant_id = 1) const uint RB = 2u;      // 一个工作组几个 8 行块
+layout(constant_id = 3) const uint CL = 1u;      // 一个块由几个 32 线程簇分列来算（>1 时在共享内存里合并）
+layout(local_size_x_id = 2) in;                  // = 32 * RB * CL
+shared float red[RB * CL * NB * 8u];
+layout(push_constant) uniform P { uint R, C, q, s, xoff, yoff, B; } pc;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x & 31u, cl = (gl_LocalInvocationID.x >> 5) % CL, rb = gl_LocalInvocationID.x / (32u * CL);
+    uint blk = gl_WorkGroupID.x * RB + rb, lane0 = cl * 32u + lane;
+    uint b0 = gl_WorkGroupID.y * NB;
+    uint C2 = pc.C >> 1, G = pc.C >> 5;
+    bool live = blk * 8u < pc.R;
+    uint qb = (pc.q >> 2) + blk * C2, sb = (pc.s >> 2) + blk * G;
+    float acc[NB * 8u];
+    for (uint i = 0u; i < NB * 8u; i++) acc[i] = 0.0;
+    for (uint k = lane0; live && k < C2; k += 32u * CL) {
+        uvec4 q = w4[qb + k];
+        uvec4 sv = w4[sb + (k >> 4)];
+        vec2 xs[NB];                              // 先把输入全读进来，让读取并行发出；超出的 token 重复读最后一个（结果不写）
+        for (uint bb = 0u; bb < NB; bb++) {
+            uint xi = pc.xoff + min(b0 + bb, pc.B - 1u) * pc.C + 2u * k;
+            xs[bb] = vec2(act[xi], act[xi + 1u]);
+        }
+        vec2 s01 = unpackHalf2x16(sv.x), s23 = unpackHalf2x16(sv.y), s45 = unpackHalf2x16(sv.z), s67 = unpackHalf2x16(sv.w);
+        float sc[8] = float[8](s01.x, s01.y, s23.x, s23.y, s45.x, s45.y, s67.x, s67.y);
+        for (uint j = 0u; j < 8u; j++) {          // 第 j 行这 2 列
+            int a = int(j < 4u ? q.x : q.y), c = int(j < 4u ? q.z : q.w);
+            int sh = int(8u * (j & 3u));
+            vec2 wq = vec2(float(bitfieldExtract(a, sh, 8)), float(bitfieldExtract(c, sh, 8))) * sc[j];
+            for (uint bb = 0u; bb < NB; bb++) acc[bb * 8u + j] += dot(wq, xs[bb]);
+        }
+    }
+    for (uint i = 0u; i < NB * 8u; i++) {
+        float v = subgroupClusteredAdd(acc[i], 32u);
+        if (lane == (i & 31u)) red[(rb * CL + cl) * NB * 8u + i] = v;
+    }
+    barrier();
+    for (uint o = gl_LocalInvocationID.x % (32u * CL); live && o < NB * 8u; o += 32u * CL) {   // 块内线程合并各簇
+        float v = 0.0;
+        for (uint c = 0u; c < CL; c++) v += red[(rb * CL + c) * NB * 8u + o];
+        uint bb = o >> 3, row = blk * 8u + (o & 7u);
+        if (b0 + bb >= pc.B) continue;
+        lg[pc.yoff + (b0 + bb) * pc.R + row] = v;
+    }
+}

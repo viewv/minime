@@ -1,0 +1,46 @@
+# Maintainer: MinIME contributors
+# 只打包 MinIME 自己的代码。腾讯的官方文件（引擎、词库、模型）由每个用户安装后运行 minime-fetch，
+# 从腾讯官方地址下载到自己的数据目录（~/.local/share/minime/official/），软件包里不包含。
+pkgname=minime-git
+_name=minime
+pkgver=r0
+pkgrel=1
+pkgdesc="Native Linux fcitx5 input method running the WeType (微信输入法) engine without Wine"
+arch=('x86_64')
+url="https://github.com/viewv/minime"
+license=('MPL-2.0')
+depends=('fcitx5' 'jemalloc' 'gcc-libs' 'glibc' 'vulkan-icd-loader' 'libxkbcommon' 'libxkbcommon-x11'
+         'libxcb' 'wayland' 'fontconfig' 'python' 'p7zip' 'curl')
+makedepends=('git' 'cmake' 'rust' 'shaderc' 'vulkan-headers')
+optdepends=('wl-clipboard: 跨设备剪贴板同步'
+            'pipewire: 离线语音录音（也可以用 libpulse 的 parec）')
+provides=("$_name")
+conflicts=("$_name")
+install=minime.install
+source=("$_name::git+$url.git")
+sha256sums=('SKIP')
+options=('!lto')
+
+pkgver() {
+  cd "$_name"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_name"
+  export RUSTUP_TOOLCHAIN=stable
+  for c in netd settings asrd; do
+    (cd "$c" && cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')")
+  done
+}
+
+build() {
+  cd "$_name"
+  export RUSTUP_TOOLCHAIN=stable
+  make CARGOFLAGS="--release --frozen"
+}
+
+package() {
+  cd "$_name"
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+}

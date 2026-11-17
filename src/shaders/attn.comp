@@ -1,0 +1,44 @@
+#version 450
+#include "common.glsl"
+layout(local_size_x = 64) in;
+// 工作组 = (token i, 头 h)：对 ctx 里的槽位做缩放点积注意力，结果写到 att[i][h*64..]
+layout(push_constant) uniform P { uint l, qkv, att; } pc;
+const uint MAXCTX = 1024u;
+shared float sc[MAXCTX];
+shared vec4 q[16];
+shared float red[64];
+void main() {
+    uint i = gl_WorkGroupID.x, h = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;
+    uint off = uint(inp[IN_OFF + i]), len = min(uint(inp[IN_LEN + i]), MAXCTX);
+    if (t < 16u) {
+        uint qi = pc.qkv + i * 3u * H + h * 64u + 4u * t;
+        q[t] = vec4(act[qi], act[qi + 1u], act[qi + 2u], act[qi + 3u]);
+    }
+    barrier();
+    float mx = -1e30;
+    for (uint p = t; p < len; p += 64u) {
+        uint base = ((uint(inp[IN_CTX + off + p]) * NL + pc.l) * 2u * H + h * 64u) >> 2;   // vec4 下标（H、64 都是 4 的倍数）
+        float s = 0.0;
+        for (uint d = 0u; d < 16u; d++) s += dot(q[d], kv4[base + d]);
+        s *= 0.125;
+        sc[p] = s;
+        mx = max(mx, s);
+    }
+    red[t] = mx;
+    barrier();
+    for (uint k = 32u; k > 0u; k >>= 1) { if (t < k) red[t] = max(red[t], red[t + k]); barrier(); }
+    mx = red[0];
+    barrier();
+    float sum = 0.0;
+    for (uint p = t; p < len; p += 64u) { float e = exp(sc[p] - mx); sc[p] = e; sum += e; }
+    red[t] = sum;
+    barrier();
+    for (uint k = 32u; k > 0u; k >>= 1) { if (t < k) red[t] += red[t + k]; barrier(); }
+    float inv = 1.0 / red[0];
+    float o = 0.0;
+    for (uint p = 0u; p < len; p++) {
+        uint base = (uint(inp[IN_CTX + off + p]) * NL + pc.l) * 2u * H + H + h * 64u;
+        o += sc[p] * kv[base + t];
+    }
+    act[pc.att + i * H + h * 64u + t] = o * inv;
+}

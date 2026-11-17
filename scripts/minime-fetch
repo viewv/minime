@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""minime-fetch —— 从腾讯官方地址下载 MinIME 需要的官方文件，校验后解包到本机。
+
+MinIME 的仓库和软件包都不包含腾讯的文件；每个用户用这个工具把它们下载到自己的数据目录：
+
+  engine  Windows 安装包里的引擎和词库（约 218 MB 下载，解包后约 270 MB）     必需
+  e2e     macOS 安装包里的整句模型（只用 HTTP Range 取 3 个文件，约 78 MB）   推荐
+  voice   官方离线语音模型包（输入法按需下载的资源包，约 103 MB；交给 minime-asrd fetch-model） 可选
+
+用法:
+  minime-fetch                 下载引擎和整句模型（已有的跳过）
+  minime-fetch all             再加上语音模型
+  minime-fetch engine|e2e|voice ...
+  minime-fetch status          看看装了哪些
+  minime-fetch engine --from WeTypeSetup_3.0.1.35_3.exe   用已经下载好的安装包
+
+文件放在 $XDG_DATA_HOME/minime/official/（缺省 ~/.local/share/minime/official/）。只依赖 python3 和 7z。
+"""
+import hashlib
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import zipfile
+import zlib
+
+UA = {"User-Agent": "Mozilla/5.0"}
+CHUNK = 1 << 20
+
+WIN_VERSION = "3.0.1.35"
+WIN_NAME = "WeTypeSetup_%s_3.exe" % WIN_VERSION
+WIN_URL = "https://download.z.weixin.qq.com/app/win/" + WIN_NAME
+WIN_SHA256 = "012954b4de350621ec846c3200bcbc48f4df4014c381b70fcd7e4864b0a01846"
+# 引擎实际装载的 DLL（libwxhld.dll 的导入，递归到同目录）和内置词库
+WIN_FILES = ["libwxhld.dll", "XNet.dll", "tensorflowlite_c.dll", "dbghelp.dll", "ime_net.dll", "wcwss.dll"]
+
+MAC_URL = "https://download.weread.qq.com/app/wxkb/mac/3.0.1/WeType_3.0.1_684.zip"
+MAC_DIR = "WeType.app/Contents/Resources/imeData.bundle/"
+MAC_FILES = {
+    "index.json": "d723c9014bf05a9e7ffd370a90e5785c",
+    "mpd_e2e.bin": "79484c59df2f9887be0f8688e79d0363",
+    "decgnr.bin": "f02c2ce40f5a7f19f2c05419f2a613eb",
+}
+
+
+def data_home():
+    return os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+
+
+OFFICIAL = os.path.join(data_home(), "minime", "official")
+ENGINE_DIR = os.path.join(OFFICIAL, "win", WIN_VERSION)
+E2E_DIR = os.path.join(OFFICIAL, "mac", "imeData")
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def die(msg):
+    print("minime-fetch: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def file_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(CHUNK), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download(url, dest):
+    part = dest + ".part"
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = last = 0
+        while True:
+            block = resp.read(CHUNK)
+            if not block:
+                break
+            out.write(block)
+            done += len(block)
+            if total and done - last >= 16 * CHUNK:
+                last = done
+                say("  %d / %d MB" % (done >> 20, total >> 20))
+    os.replace(part, dest)
+
+
+# ---------------- 引擎（Windows 安装包） ----------------
+
+def engine_ok():
+    return os.path.isfile(os.path.join(ENGINE_DIR, "libwxhld.dll")) and \
+        os.path.isfile(os.path.join(ENGINE_DIR, "BuildIn", "index.json"))
+
+
+def fetch_engine(src=None, force=False):
+    if engine_ok() and not force:
+        say("引擎：已安装（%s）" % ENGINE_DIR)
+        return
+    seven = shutil.which("7z") or shutil.which("7zz") or die("需要 7z（Arch: p7zip，Debian/Ubuntu: 7zip 或 p7zip-full，Fedora: p7zip-plugins）")
+    os.makedirs(OFFICIAL, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="fetch-", dir=OFFICIAL) as tmp:
+        exe = src
+        if not exe:
+            exe = os.path.join(tmp, WIN_NAME)
+            say("下载 Windows 安装包（约 218 MB）：%s" % WIN_URL)
+            download(WIN_URL, exe)
+        got = file_hash(exe, "sha256")
+        if got != WIN_SHA256:
+            die("安装包 SHA-256 不对：%s（应为 %s）" % (got, WIN_SHA256))
+        say("校验通过，解包引擎和词库")
+        out = os.path.join(tmp, "x")
+        pats = ["-i!%s/%s" % (WIN_VERSION, f) for f in WIN_FILES] + ["-i!%s/BuildIn/*" % WIN_VERSION]
+        subprocess.run([seven, "x", "-y", "-o" + out] + pats + [exe], check=True, stdout=subprocess.DEVNULL)
+        got_dir = os.path.join(out, WIN_VERSION)
+        if not os.path.isfile(os.path.join(got_dir, "libwxhld.dll")):
+            die("解包后没有找到 libwxhld.dll")
+        if os.path.isdir(ENGINE_DIR):
+            shutil.rmtree(ENGINE_DIR)
+        os.makedirs(os.path.dirname(ENGINE_DIR), exist_ok=True)
+        os.replace(got_dir, ENGINE_DIR)
+    say("引擎：已安装到 %s" % ENGINE_DIR)
+
+
+# ---------------- 整句模型（macOS 安装包，只取 3 个文件） ----------------
+
+class RangeFile(io.RawIOBase):
+    """用 HTTP Range 请求按需读远程文件，配合 zipfile 只取需要的成员。"""
+
+    def __init__(self, url):
+        self.url, self.pos = url, 0
+        req = urllib.request.Request(url, method="HEAD", headers=UA)
+        self.size = int(urllib.request.urlopen(req, timeout=60).headers["Content-Length"])
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
+        return self.pos
+
+    def readinto(self, buf):
+        n = min(len(buf), self.size - self.pos)
+        if n <= 0:
+            return 0
+        hdr = dict(UA, Range="bytes=%d-%d" % (self.pos, self.pos + n - 1))
+        data = urllib.request.urlopen(urllib.request.Request(self.url, headers=hdr), timeout=120).read()
+        buf[:len(data)] = data
+        self.pos += len(data)
+        return len(data)
+
+
+def e2e_ok():
+    return all(os.path.isfile(os.path.join(E2E_DIR, f)) for f in MAC_FILES)
+
+
+def fetch_member(url, info, dest):
+    """一个 zip 成员：读本地文件头算出数据的位置，一次 Range 请求流式下载压缩数据，边下边解压。"""
+    hdr = dict(UA, Range="bytes=%d-%d" % (info.header_offset, info.header_offset + 29))
+    lh = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60).read()
+    if lh[:4] != b"PK\x03\x04":
+        die("zip 本地文件头不对：%s" % info.filename)
+    start = info.header_offset + 30 + int.from_bytes(lh[26:28], "little") + int.from_bytes(lh[28:30], "little")
+    end = start + info.compress_size - 1
+    if info.compress_type == zipfile.ZIP_DEFLATED:
+        dec = zlib.decompressobj(-15)
+    elif info.compress_type == zipfile.ZIP_STORED:
+        dec = None
+    else:
+        die("不支持的压缩方式 %d：%s" % (info.compress_type, info.filename))
+    crc = 0
+    req = urllib.request.Request(url, headers=dict(UA, Range="bytes=%d-%d" % (start, end)))
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+        while True:
+            block = resp.read(CHUNK)
+            if not block:
+                break
+            data = dec.decompress(block) if dec else block
+            crc = zlib.crc32(data, crc)
+            out.write(data)
+        if dec:
+            tail = dec.flush()
+            crc = zlib.crc32(tail, crc)
+            out.write(tail)
+    if crc != info.CRC:
+        die("%s 的 CRC 不对" % info.filename)
+
+
+def fetch_e2e(force=False):
+    if e2e_ok() and not force:
+        say("整句模型：已安装（%s）" % E2E_DIR)
+        return
+    say("从 macOS 安装包取整句模型（约 78 MB）：%s" % MAC_URL)
+    z = zipfile.ZipFile(io.BufferedReader(RangeFile(MAC_URL), 1 << 20))   # 只读目录
+    os.makedirs(E2E_DIR, exist_ok=True)
+    for name, md5 in MAC_FILES.items():
+        dest = os.path.join(E2E_DIR, name)
+        part = dest + ".part"
+        fetch_member(MAC_URL, z.getinfo(MAC_DIR + name), part)
+        got = file_hash(part, "md5")
+        if got != md5:
+            os.unlink(part)
+            die("%s 的 MD5 不对：%s（应为 %s）" % (name, got, md5))
+        os.replace(part, dest)
+        say("  %s" % name)
+    say("整句模型：已安装到 %s" % E2E_DIR)
+
+
+# ---------------- 语音模型（交给 minime-asrd） ----------------
+
+def asrd_bin():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (shutil.which("minime-asrd"), os.path.join(here, "..", "asrd", "target", "release", "minime-asrd")):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def voice_ok():
+    d = os.path.join(data_home(), "minime", "asr", "model")
+    return os.path.isdir(d) and any(f.endswith(".xnet") for f in os.listdir(d))
+
+
+def fetch_voice(force=False):
+    if voice_ok() and not force:
+        say("语音模型：已安装")
+        return
+    b = asrd_bin() or die("没有找到 minime-asrd（离线语音组件没有安装）")
+    say("下载语音模型（约 100 MB）")
+    subprocess.run([b, "fetch-model"], check=True)
+
+
+def status():
+    rows = [("引擎", engine_ok(), ENGINE_DIR, "必需"), ("整句模型", e2e_ok(), E2E_DIR, "推荐"),
+            ("语音模型", voice_ok(), os.path.join(data_home(), "minime", "asr", "model"), "可选")]
+    for name, ok, path, need in rows:
+        say("%-6s %s  %s（%s）" % (name, "已安装" if ok else "未安装", path, need))
+    return 0 if engine_ok() else 1
+
+
+def main(argv):
+    if any(a in ("-h", "--help", "help") for a in argv):
+        print(__doc__)
+        return 0
+    force = "--force" in argv
+    src = None
+    if "--from" in argv:
+        i = argv.index("--from")
+        src = argv[i + 1] if i + 1 < len(argv) else die("--from 后面要跟安装包路径")
+        argv = argv[:i] + argv[i + 2:]
+    what = [a for a in argv if not a.startswith("--")] or ["engine", "e2e"]
+    if what == ["status"]:
+        return status()
+    if "all" in what:
+        what = ["engine", "e2e", "voice"]
+    for w in what:
+        if w == "engine":
+            fetch_engine(src, force)
+        elif w == "e2e":
+            fetch_e2e(force)
+        elif w == "voice":
+            fetch_voice(force)
+        else:
+            die("不认识的参数：%s（minime-fetch --help）" % w)
+    say("完成。重启引擎生效：systemctl --user restart minime-engined")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

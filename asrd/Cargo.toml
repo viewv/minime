@@ -1,0 +1,22 @@
+[package]
+name = "minime-asrd"
+version = "0.1.1"
+license = "MPL-2.0"
+edition = "2021"
+description = "MinIME 离线语音服务：按住说话，本地识别（模型来自官方语音包，不随仓库分发）"
+publish = false
+
+[[bin]]
+name = "minime-asrd"
+path = "src/main.rs"
+
+[dependencies]
+# 微信输入法离线 ASR 的开源复刻（MIT）；只用 CPU 后端，不需要 CUDA
+wechat-asr-gpu = { git = "https://github.com/Enter-tainer/wechat-asr-gpu", rev = "c97739b22a69a38c655b9036337c3d6d08f697d2", default-features = false }
+md-5 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

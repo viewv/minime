@@ -1,0 +1,9 @@
+[Unit]
+Description=MinIME 离线语音（本地识别，不联网）
+After=graphical-session.target pipewire.service
+Requires=minime-asrd.socket
+
+[Service]
+ExecStart=/usr/bin/minime-asrd
+Restart=on-failure
+RestartSec=5

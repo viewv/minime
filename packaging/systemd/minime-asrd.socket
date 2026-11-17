@@ -1,0 +1,9 @@
+[Unit]
+Description=MinIME 离线语音（按需启动）
+
+[Socket]
+ListenStream=%t/minime-asrd.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

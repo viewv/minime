@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MinIME 设置
+Name[en]=MinIME Settings
+Comment=MinIME 输入法的输入方案、语音、词库与跨设备设置
+Exec=minime-settings
+Icon=preferences-desktop-keyboard
+Categories=Settings;Utility;
+StartupWMClass=minime-settings
+Keywords=minime;wetype;input;pinyin;ime;

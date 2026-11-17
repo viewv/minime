@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: arch
+            image: docker.io/library/archlinux:latest
+          - distro: debian
+            image: docker.io/library/debian:trixie
+          - distro: ubuntu
+            image: docker.io/library/ubuntu:26.10
+          - distro: fedora
+            image: registry.fedoraproject.org/fedora:44
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install git
+        run: |
+          command -v git && exit 0
+          if command -v pacman; then pacman -Syu --noconfirm git
+          elif command -v apt-get; then apt-get update -qq && apt-get install -y -qq git ca-certificates
+          else dnf install -y -q git; fi
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: packaging/ci/deps.sh ${{ matrix.distro }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            netd/target
+            settings/target
+            asrd/target
+          key: cargo-${{ matrix.distro }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.distro }}-
+      - name: Build
+        run: make
+      - name: Test (network protocol)
+        run: cd netd && cargo test --release --locked

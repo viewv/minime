@@ -1,0 +1,12 @@
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+// x[i][k] = wte[tok[i]][k] + wpe[pos[i]][k]
+layout(push_constant) uniform P { uint n, wte, wpe, xoff; } pc;   // wte/wpe：fp16 下标
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.n * H) return;
+    uint i = g / H, k = g % H;
+    uint tok = uint(inp[IN_TOK + i]), pos = uint(inp[IN_POS + i]);
+    act[pc.xoff + g] = wHalf(pc.wte + tok * H + k) + wHalf(pc.wpe + pos * H + k);
+}
