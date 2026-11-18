@@ -3,10 +3,10 @@
 *Yet another Linux port of the WeType engine* —— 在 Linux 上原生运行微信输入法引擎的 fcitx5 输入法。
 
 > [!WARNING]
-> **测试版（0.1.3）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
+> **测试版（0.1.4）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
 > 不建议作为唯一的输入法使用。
 >
-> **Beta (0.1.3)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
+> **Beta (0.1.4)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
 > your only input method. 
 
 微信输入法官方只提供 Windows、macOS 和移动端版本。在 Linux 上使用它，常见的做法是用 Wine 运行 Windows 版、
@@ -106,7 +106,7 @@ flowchart TB
 
 ## 安装
 
-需要 x86-64 Linux、fcitx5 和 systemd。整个过程分四步：装软件包 → 把 fcitx5 设为输入法 → 运行 `minime-fetch` → 切换使用。
+需要 x86-64 Linux、fcitx5 和 systemd。整个过程分四步：装软件包 → 把 fcitx5 设为输入法 → 下载官方文件 → 切换使用。
 
 ### 1. 安装软件包
 
@@ -156,15 +156,18 @@ make && sudo make install PREFIX=/usr
 
 登录后托盘里出现键盘图标，就说明 fcitx5 在运行了。
 
-### 3. 运行 `minime-fetch`
+### 3. 下载官方文件
 
-以普通用户身份运行（不要加 sudo）：
+打开「MinIME 设置」（应用菜单里，或运行 `minime-settings`）：第一次打开会显示引导页，选好要下载的文件，
+点「开始下载」，等进度条走完就配置好了。以后也可以在「设置 → 模型 → 官方文件」里下载或重新配置。
+
+也可以在终端里以普通用户身份运行（不要加 sudo）：
 
 ```bash
 minime-fetch
 ```
 
-它会依次：
+两种方式做的事一样，依次：
 
 1. 从腾讯官方下载引擎和词库（约 218 MB）、整句模型（约 78 MB），校验后解包到 `~/.local/share/minime/official/`。
    整句模型的下载服务器比较慢，可能要几分钟，下载时会显示进度；

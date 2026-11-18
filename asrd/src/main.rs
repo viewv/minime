@@ -91,10 +91,16 @@ fn fetch_model() -> Result<(), String> {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let apk = parent.join("ime_asr_decoder_model.apk");
     let ok_size = std::fs::metadata(&apk).map(|m| m.len() == MODEL_SIZE).unwrap_or(false);
+    // minime-fetch --json 调用时：报总大小和阶段，curl 不打进度条（minime-fetch 按文件长度算进度）
+    let json = std::env::var_os("MINIME_FETCH_JSON").is_some();
     if !ok_size {
-        println!("下载官方语音包（{:.0} MB）……", MODEL_SIZE as f64 / 1e6);
+        if json {
+            println!("{{\"ev\":\"total\",\"bytes\":{MODEL_SIZE}}}");
+        } else {
+            println!("下载官方语音包（{:.0} MB）……", MODEL_SIZE as f64 / 1e6);
+        }
         let st = Command::new("curl")
-            .args(["-fL", "--retry", "3", "-C", "-", "-o"])
+            .args(if json { ["-sfL", "--retry", "3", "-C", "-", "-o"] } else { ["-fL", "--retry", "3", "-C", "-", "-o"] })
             .arg(&apk)
             .arg(MODEL_URL)
             .status()
@@ -103,7 +109,11 @@ fn fetch_model() -> Result<(), String> {
             return Err("下载失败".into());
         }
     }
-    print!("校验 md5……");
+    if json {
+        println!("{{\"ev\":\"verify\"}}");
+    } else {
+        print!("校验 md5……");
+    }
     let _ = std::io::stdout().flush();
     let mut f = std::fs::File::open(&apk).map_err(|e| e.to_string())?;
     let mut h = Md5::new();
@@ -120,7 +130,11 @@ fn fetch_model() -> Result<(), String> {
         let _ = std::fs::remove_file(&apk);
         return Err(format!("md5 不符（{md5}），已删除，请重试"));
     }
-    println!("通过");
+    if json {
+        println!("{{\"ev\":\"extract\"}}");
+    } else {
+        println!("通过");
+    }
     wechat_asr_gpu::pack::unpack(&apk, &dir).map_err(|e| format!("解包失败：{e}"))?;
     let _ = std::fs::remove_file(&apk);
     println!("模型已安装：{}", dir.display());

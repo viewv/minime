@@ -14,6 +14,10 @@ MinIME 的仓库和软件包都不包含腾讯的文件；每个用户用这个�
   minime-fetch status          看看装了哪些
   minime-fetch setup           只做下载后的配置：启用并重启引擎服务、把 MinIME 加进 fcitx5 的输入法列表
   minime-fetch engine --from WeTypeSetup_3.0.1.35_3.exe   用已经下载好的安装包
+  minime-fetch ... --json      每行输出一个 JSON 事件（给设置程序显示进度用）：
+                               {"ev":"stage","item":"engine|e2e|voice|setup","stage":"download|verify|extract|run|done|skip"}
+                               {"ev":"progress","item":…,"done":字节,"total":字节,"speed":字节每秒}
+                               {"ev":"log","msg":…}  {"ev":"error","msg":…}  {"ev":"done","ok":true}
 
 下载完成后会自动做 setup 那一步（加 --no-setup 跳过）。
 
@@ -60,12 +64,33 @@ ENGINE_DIR = os.path.join(OFFICIAL, "win", WIN_VERSION)
 E2E_DIR = os.path.join(OFFICIAL, "mac", "imeData")
 
 
+JSON = False          # --json：给设置程序读的事件流
+CUR = ""              # 当前在处理的项（engine / e2e / voice / setup），进度事件带上它
+
+
+def emit(**ev):
+    print(json.dumps(ev, ensure_ascii=False), flush=True)
+
+
+def stage(item, st):
+    global CUR
+    CUR = item
+    if JSON:
+        emit(ev="stage", item=item, stage=st)
+
+
 def say(msg):
-    print(msg, flush=True)
+    if JSON:
+        emit(ev="log", item=CUR, msg=msg.strip())
+    else:
+        print(msg, flush=True)
 
 
 def die(msg):
-    print("minime-fetch: " + msg, file=sys.stderr)
+    if JSON:
+        emit(ev="error", item=CUR, msg=msg)
+    else:
+        print("minime-fetch: " + msg, file=sys.stderr)
     sys.exit(1)
 
 
@@ -82,15 +107,24 @@ class Progress:
 
     def __init__(self, total):
         self.total, self.done, self.t0, self.last = total, 0, time.time(), 0
-        self.tty = sys.stdout.isatty()
+        self.tty = sys.stdout.isatty() and not JSON
+        self.last_t = 0.0
 
     def add(self, n):
         self.done += n
-        if self.tty or self.done - self.last >= 16 * CHUNK:
+        if JSON:
+            if time.time() - self.last_t >= 0.2:
+                self.last_t = time.time()
+                self.show()
+        elif self.tty or self.done - self.last >= 16 * CHUNK:
             self.last = self.done
             self.show()
 
     def show(self, end=False):
+        if JSON:
+            emit(ev="progress", item=CUR, done=self.done, total=self.total,
+                 speed=int(self.done / max(time.time() - self.t0, 0.001)))
+            return
         speed = self.done / max(time.time() - self.t0, 0.001) / (1 << 20)
         pct = " %3d%%" % (self.done * 100 // self.total) if self.total else ""
         line = "  %6.1f / %.1f MB%s  %.1f MB/s" % (self.done / (1 << 20), self.total / (1 << 20), pct, speed)
@@ -127,7 +161,9 @@ def engine_ok():
 
 
 def fetch_engine(src=None, force=False):
+    stage("engine", "download")
     if engine_ok() and not force:
+        stage("engine", "skip")
         say("引擎：已安装（%s）" % ENGINE_DIR)
         return
     seven = shutil.which("7z") or shutil.which("7zz") or die("需要 7z（Arch: p7zip，Debian/Ubuntu: 7zip 或 p7zip-full，Fedora: p7zip-plugins）")
@@ -138,9 +174,11 @@ def fetch_engine(src=None, force=False):
             exe = os.path.join(tmp, WIN_NAME)
             say("下载 Windows 安装包（约 218 MB）：%s" % WIN_URL)
             download(WIN_URL, exe)
+        stage("engine", "verify")
         got = file_hash(exe, "sha256")
         if got != WIN_SHA256:
             die("安装包 SHA-256 不对：%s（应为 %s）" % (got, WIN_SHA256))
+        stage("engine", "extract")
         say("校验通过，解包引擎和词库")
         out = os.path.join(tmp, "x")
         pats = ["-i!%s/%s" % (WIN_VERSION, f) for f in WIN_FILES] + ["-i!%s/BuildIn/*" % WIN_VERSION]
@@ -153,6 +191,7 @@ def fetch_engine(src=None, force=False):
         os.makedirs(os.path.dirname(ENGINE_DIR), exist_ok=True)
         os.replace(got_dir, ENGINE_DIR)
     say("引擎：已安装到 %s" % ENGINE_DIR)
+    stage("engine", "done")
 
 
 # ---------------- 整句模型（macOS 安装包，只取 3 个文件） ----------------
@@ -193,7 +232,7 @@ def e2e_ok():
     return all(os.path.isfile(os.path.join(E2E_DIR, f)) for f in MAC_FILES)
 
 
-def fetch_member(url, info, dest):
+def fetch_member(url, info, dest, bar):
     """一个 zip 成员：读本地文件头算出数据的位置，一次 Range 请求流式下载压缩数据，边下边解压。"""
     hdr = dict(UA, Range="bytes=%d-%d" % (info.header_offset, info.header_offset + 29))
     lh = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60).read()
@@ -210,7 +249,6 @@ def fetch_member(url, info, dest):
     crc = 0
     req = urllib.request.Request(url, headers=dict(UA, Range="bytes=%d-%d" % (start, end)))
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
-        bar = Progress(info.compress_size)
         while True:
             block = resp.read(CHUNK)
             if not block:
@@ -219,7 +257,6 @@ def fetch_member(url, info, dest):
             data = dec.decompress(block) if dec else block
             crc = zlib.crc32(data, crc)
             out.write(data)
-        bar.finish()
         if dec:
             tail = dec.flush()
             crc = zlib.crc32(tail, crc)
@@ -229,23 +266,30 @@ def fetch_member(url, info, dest):
 
 
 def fetch_e2e(force=False):
+    stage("e2e", "download")
     if e2e_ok() and not force:
+        stage("e2e", "skip")
         say("整句模型：已安装（%s）" % E2E_DIR)
         return
     say("从 macOS 安装包取整句模型（约 78 MB）：%s" % MAC_URL)
     z = zipfile.ZipFile(io.BufferedReader(RangeFile(MAC_URL), 1 << 20))   # 只读目录
     os.makedirs(E2E_DIR, exist_ok=True)
+    infos = {name: z.getinfo(MAC_DIR + name) for name in MAC_FILES}
+    bar = Progress(sum(i.compress_size for i in infos.values()))      # 三个文件合成一条进度
     for name, md5 in MAC_FILES.items():
         dest = os.path.join(E2E_DIR, name)
         part = dest + ".part"
-        say("  %s" % name)
-        fetch_member(MAC_URL, z.getinfo(MAC_DIR + name), part)
+        if not JSON:
+            say("  %s" % name)
+        fetch_member(MAC_URL, infos[name], part, bar)
         got = file_hash(part, "md5")
         if got != md5:
             os.unlink(part)
             die("%s 的 MD5 不对：%s（应为 %s）" % (name, got, md5))
         os.replace(part, dest)
+    bar.finish()
     say("整句模型：已安装到 %s" % E2E_DIR)
+    stage("e2e", "done")
 
 
 # ---------------- 语音模型（交给 minime-asrd） ----------------
@@ -264,12 +308,54 @@ def voice_ok():
 
 
 def fetch_voice(force=False):
+    stage("voice", "download")
     if voice_ok() and not force:
+        stage("voice", "skip")
         say("语音模型：已安装")
         return
     b = asrd_bin() or die("没有找到 minime-asrd（离线语音组件没有安装）")
     say("下载语音模型（约 100 MB）")
-    subprocess.run([b, "fetch-model"], check=True)
+    if not JSON:
+        subprocess.run([b, "fetch-model"], check=True)
+        return
+    # JSON：minime-asrd 用 curl 下到 asr/ime_asr_decoder_model.apk，先报总大小；这里按文件长度报进度
+    apk = os.path.join(data_home(), "minime", "asr", "ime_asr_decoder_model.apk")
+    env = dict(os.environ, MINIME_FETCH_JSON="1")
+    p = subprocess.Popen([b, "fetch-model"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    import threading
+    total = [0]
+
+    def reader():
+        for line in p.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("ev") == "total":
+                    total[0] = int(ev.get("bytes") or 0)
+                elif ev.get("ev") == "verify":
+                    stage("voice", "verify")
+                elif ev.get("ev") == "extract":
+                    stage("voice", "extract")
+            elif line:
+                say(line)
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    bar = None
+    while p.poll() is None:
+        time.sleep(0.25)
+        if total[0] and os.path.exists(apk):
+            if bar is None:
+                bar = Progress(total[0])
+            bar.add(os.path.getsize(apk) - bar.done)
+    t.join(2)
+    if p.returncode != 0:
+        die("语音模型下载失败")
+    if bar:
+        bar.finish()
+    stage("voice", "done")
 
 
 # ---------------- 装好之后：启动引擎服务、把 MinIME 加进 fcitx5 ----------------
@@ -345,6 +431,7 @@ def setup_voice():
 
 
 def setup(voice=False, engine=True):
+    stage("setup", "run")
     if not engine_ok():
         say("引擎还没有下载，先运行 minime-fetch")
         return 1
@@ -353,6 +440,7 @@ def setup(voice=False, engine=True):
         setup_fcitx5()
     if voice:
         setup_voice()
+    stage("setup", "done")
     return 0
 
 
@@ -368,6 +456,8 @@ def main(argv):
     if any(a in ("-h", "--help", "help") for a in argv):
         print(__doc__)
         return 0
+    global JSON
+    JSON = "--json" in argv
     force = "--force" in argv
     src = None
     if "--from" in argv:
@@ -398,8 +488,22 @@ def main(argv):
     return setup(voice="voice" in what, engine="engine" in what or "e2e" in what)
 
 
-if __name__ == "__main__":
+def run_main():
     try:
-        sys.exit(main(sys.argv[1:]))
+        rc = main(sys.argv[1:])
     except KeyboardInterrupt:
         sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:                      # 网络断了、磁盘满了等：JSON 模式下也要告诉设置程序
+        if JSON:
+            emit(ev="error", item=CUR, msg="%s: %s" % (type(e).__name__, e))
+            sys.exit(1)
+        raise
+    if JSON:
+        emit(ev="done", ok=rc == 0)
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    run_main()

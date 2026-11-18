@@ -9,6 +9,7 @@
 
 mod conf;
 mod dicts;
+mod fetch;
 mod netd;
 
 use std::borrow::Cow;
@@ -73,6 +74,12 @@ const ICONS: &[(&str, &[u8])] = &[
     ("icons/laptop.svg", include_bytes!("../assets/icons/laptop.svg")),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/circle-check.svg", include_bytes!("../assets/icons/circle-check.svg")),
+    ("icons/download.svg", include_bytes!("../assets/icons/download.svg")),
+    ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
+    ("icons/sparkles.svg", include_bytes!("../assets/icons/sparkles.svg")),
+    ("icons/package.svg", include_bytes!("../assets/icons/package.svg")),
+    ("icons/arrow-right.svg", include_bytes!("../assets/icons/arrow-right.svg")),
+    ("icons/circle-alert.svg", include_bytes!("../assets/icons/circle-alert.svg")),
 ];
 
 impl AssetSource for AppAssets {
@@ -193,6 +200,14 @@ struct Settings {
     /// 后台服务的状态（systemctl is-active），在「关于」页每两秒刷新一次
     svc: [String; 3],
     svc_at: Option<Instant>,
+    /// 第一次运行的引导页（整窗显示，盖住侧栏和设置页）
+    welcome: bool,
+    /// 官方文件下载（minime-fetch --json）
+    fetch_job: fetch::Job,
+    fetch_rx: Option<mpsc::Receiver<Value>>,
+    fetch_child: Option<std::process::Child>,
+    /// 整句模型、语音模型要不要一起下（引擎必需，总是下）
+    fetch_pick: [bool; 3],
 }
 
 /// 「关于 → 服务」里列出的服务：(systemd 单元, 名称, 说明)
@@ -247,6 +262,9 @@ impl Settings {
             Some("models") => Page::Models,
             _ => Page::Input,
         };
+        // 第一次打开：官方引擎还没下载、引擎服务也没在跑（开发环境用仓库里的引擎，服务在跑，不打扰）；
+        // --welcome 强制打开（测试用）
+        let welcome = std::env::args().any(|a| a == "--welcome") || (!fetch::installed("engine") && !engine_running());
         // --enter-code：直接打开“输入匹配码”（从托盘/命令行跳转用）
         let enter = std::env::args().any(|a| a == "--enter-code");
         if enter {
@@ -290,6 +308,11 @@ impl Settings {
             migrate: Migrate::Idle,
             migrate_rx: None,
             migrate_cancel: None,
+            welcome,
+            fetch_job: fetch::Job::default(),
+            fetch_rx: None,
+            fetch_child: None,
+            fetch_pick: [true, true, false],
         }
     }
 
@@ -384,6 +407,29 @@ impl Settings {
             self.hot_mtime = m;
             self.hot = minime_netd::hotwords::load();
             dirty = true;
+        }
+        let mut fetch_events = Vec::new();
+        if let Some(rx) = &self.fetch_rx {
+            while let Ok(v) = rx.try_recv() {
+                fetch_events.push(v);
+            }
+        }
+        for v in fetch_events {
+            dirty = true;
+            self.fetch_job.apply(&v);
+            if v["ev"] == "exit" {
+                self.fetch_rx = None;
+                if let Some(mut c) = self.fetch_child.take() {
+                    let _ = c.wait();
+                }
+                self.reload_dicts();
+                self.svc_at = None;
+                self.toast = Some(if self.fetch_job.ok {
+                    ("官方文件已就绪".into(), true, Instant::now())
+                } else {
+                    ("下载没有完成".into(), false, Instant::now())
+                });
+            }
         }
         while let Ok(v) = self.cmd_rx.try_recv() {
             dirty = true;
@@ -618,7 +664,7 @@ fn asr_status() -> (String, u32) {
         .unwrap_or(false);
     match (running, model) {
         (true, true) => ("按住 Alt 不放说话，松开上屏；短按和 Alt 组合键照常使用，Esc 取消。完全本地识别，不联网".into(), TEXT2),
-        (_, false) => ("语音模型还没有下载：运行 minime-fetch voice（从腾讯官方下载约 100 MB）".into(), RED),
+        (_, false) => ("语音模型还没有下载：到「模型」页下载（从腾讯官方下载约 100 MB）".into(), RED),
         (false, true) => ("语音服务没有启用：systemctl --user enable --now minime-asrd.socket".into(), RED),
     }
 }
@@ -1388,7 +1434,7 @@ impl Settings {
                 && state != "active"
                 && !official_engine_present()
             {
-                "还没有下载官方引擎：在终端运行 minime-fetch（从腾讯官方下载），再点重启".into()
+                "还没有下载官方引擎：到「模型」页下载".into()
             } else {
                 SharedString::from(*desc)
             };
@@ -1433,6 +1479,15 @@ fn official_dir() -> std::path::PathBuf {
 /// minime-fetch 下载的官方引擎在不在（开发环境用仓库里的 vendor/，不算）
 fn official_engine_present() -> bool {
     official_dir().join("win/3.0.1.35/libwxhld.dll").exists()
+}
+
+/// 引擎服务在不在跑
+fn engine_running() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "minime-engined.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 各服务的 systemctl is-active 结果（没装的单元是 "inactive" 或 "unknown"，装没装另外看单元文件）
@@ -1722,7 +1777,362 @@ impl Settings {
         .detach();
     }
 
-    fn page_models(&self, _cx: &mut Context<Self>) -> Div {
+    fn start_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.fetch_job.running {
+            return;
+        }
+        let todo: Vec<&str> = fetch::ITEMS
+            .iter()
+            .enumerate()
+            .filter(|(i, (id, ..))| !fetch::installed(id) && self.fetch_pick[*i])
+            .map(|(_, (id, ..))| *id)
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        self.fetch_job = fetch::Job { running: true, ..Default::default() };
+        match fetch::spawn(&todo, tx) {
+            Ok(child) => {
+                self.fetch_child = Some(child);
+                self.fetch_rx = Some(rx);
+            }
+            Err(e) => {
+                self.fetch_job = fetch::Job { finished: true, error: Some(e), ..Default::default() };
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_fetch(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.fetch_child.take() {
+            fetch::cancel(&mut c);
+        }
+        self.fetch_rx = None;
+        self.fetch_job.running = false;
+        self.fetch_job.finished = true;
+        self.fetch_job.ok = false;
+        self.fetch_job.error = Some("已取消。再点一次会接着下载没完成的部分".into());
+        cx.notify();
+    }
+
+    /// 要下载的项（没装、而且选了；引擎总是选上）
+    fn fetch_todo(&self) -> Vec<usize> {
+        (0..fetch::ITEMS.len())
+            .filter(|&i| !fetch::installed(fetch::ITEMS[i].0) && (i == 0 || self.fetch_pick[i]))
+            .collect()
+    }
+
+    fn open_welcome(&mut self, cx: &mut Context<Self>) {
+        if !self.fetch_job.running {
+            self.fetch_job = fetch::Job::default();
+        }
+        self.welcome = true;
+        cx.notify();
+    }
+
+    /// 「模型」页顶上的「官方文件」卡片：三项的状态，缺了就给下载入口（打开引导页）
+    fn official_card(&self, cx: &mut Context<Self>) -> Div {
+        let mut c = card();
+        let n = fetch::ITEMS.len();
+        for (i, (id, name, _, size)) in fetch::ITEMS.iter().enumerate() {
+            let inst = fetch::installed(id);
+            let (t, col) = if inst {
+                ("已下载", GREEN)
+            } else if *id == "engine" {
+                ("未下载（必需）", RED)
+            } else {
+                ("未下载", TEXT2)
+            };
+            let desc: SharedString = if inst { fetch::ITEMS[i].2.into() } else { format!("下载{size}").into() };
+            c = c.child(row(*name, Some(desc), div().text_size(px(13.)).text_color(rgb(col)).child(t), false));
+            let _ = n;
+        }
+        let missing = fetch::ITEMS.iter().filter(|(id, ..)| !fetch::installed(id)).count();
+        let (label, desc) = if self.fetch_job.running {
+            ("查看进度", "正在下载")
+        } else if missing > 0 {
+            ("下载", "从腾讯官方地址下载缺少的文件，下载完自动配置")
+        } else {
+            ("重新配置", "重新启用引擎服务、把 MinIME 加进 fcitx5")
+        };
+        c.child(row(
+            "下载与配置",
+            Some(desc.into()),
+            Button::new("official-open").label(label).small().primary().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_welcome(cx))),
+            true,
+        ))
+    }
+
+    /// 第一次运行的引导：欢迎 → 选择要下载的 → 进度 → 完成
+    fn welcome_view(&self, cx: &mut Context<Self>) -> Div {
+        let job = &self.fetch_job;
+        // 0 选择 / 1 下载 / 2 完成（出错也算 2）
+        let step = if job.running { 1 } else if job.finished { 2 } else { 0 };
+        let failed = job.finished && !job.ok;
+
+        // 顶部：标志 + 标题
+        let logo = div()
+            .size(px(64.))
+            .rounded(px(18.))
+            .bg(rgb(GREEN))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon("icons/keyboard.svg").size(px(32.)).text_color(rgb(0xFFFFFF)));
+        let (title, sub): (&str, String) = match (step, failed) {
+            (0, _) => ("欢迎使用 MinIME", "在 Linux 上使用微信输入法的官方引擎。开始之前，需要从腾讯官方下载引擎文件，选好后点「开始下载」。".into()),
+            (1, _) => ("正在准备", "文件下载完会自动配置，可以先去做别的，不要关掉这个窗口。".into()),
+            (_, false) => ("准备好了", "按 Ctrl+Space 切换到 MinIME，就可以开始打字了。".into()),
+            (_, true) => ("没有完成", job.error.clone().unwrap_or_else(|| "下载中断了".into())),
+        };
+
+        // 步骤指示：选择 · 下载 · 完成
+        let mut steps = div().flex().items_center().gap(px(10.));
+        for (k, name) in ["选择", "下载", "完成"].iter().enumerate() {
+            let on = k <= step;
+            if k > 0 {
+                steps = steps.child(div().w(px(28.)).h(px(2.)).rounded_full().bg(rgb(if on { GREEN } else { 0xDDE0E4 })));
+            }
+            steps = steps.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .size(px(20.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .bg(rgb(if on { GREEN } else { 0xDDE0E4 }))
+                            .text_color(rgb(if on { 0xFFFFFF } else { TEXT2 }))
+                            .child(format!("{}", k + 1)),
+                    )
+                    .child(div().text_size(px(13.)).text_color(rgb(if k == step { TEXT } else { TEXT2 })).child(*name)),
+            );
+        }
+
+        // 三张选项卡
+        let icons = ["icons/package.svg", "icons/sparkles.svg", "icons/mic.svg"];
+        let tags = [("必需", RED), ("推荐", GREEN), ("可选", TEXT2)];
+        let mut cards = div().w_full().flex().flex_col().gap(px(10.));
+        for (i, (id, name, desc, size)) in fetch::ITEMS.iter().enumerate() {
+            let inst = fetch::installed(id);
+            let st = &job.items[i];
+            let picked = inst || i == 0 || self.fetch_pick[i];
+            let locked = inst || i == 0 || step != 0;
+            let right: AnyElement = if step != 0 && !st.stage.is_empty() {
+                let (t, col) = match st.stage.as_str() {
+                    "download" if st.total > 0 => (format!("{}%", st.done * 100 / st.total.max(1)), TEXT),
+                    "download" => ("连接中…".into(), TEXT2),
+                    "verify" => ("校验中…".into(), TEXT2),
+                    "extract" => ("解包中…".into(), TEXT2),
+                    "done" => ("已完成".into(), GREEN),
+                    "skip" => ("已下载".into(), GREEN),
+                    _ => (String::new(), TEXT2),
+                };
+                div().text_size(px(13.)).text_color(rgb(col)).child(t).into_any_element()
+            } else if inst {
+                div().text_size(px(13.)).text_color(rgb(GREEN)).child("已下载").into_any_element()
+            } else {
+                // 勾选圈
+                let mark = if picked {
+                    div().size(px(22.)).rounded_full().bg(rgb(GREEN)).flex().items_center().justify_center()
+                        .child(div().text_size(px(13.)).text_color(rgb(0xFFFFFF)).child("✓"))
+                } else {
+                    div().size(px(22.)).rounded_full().border_2().border_color(rgb(0xC9CDD2))
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(div().text_size(px(13.)).text_color(rgb(TEXT2)).child(*size))
+                    .child(mark)
+                    .into_any_element()
+            };
+            let bar = (st.stage == "download" && st.total > 0).then(|| {
+                let frac = (st.done as f32 / st.total as f32).clamp(0., 1.);
+                div()
+                    .pt(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().h(px(6.)).w_full().rounded_full().bg(rgb(0xE8EBEE)).child(div().h_full().rounded_full().bg(rgb(GREEN)).w(relative(frac))))
+                    .child(div().text_size(px(12.)).text_color(rgb(TEXT2)).child(format!(
+                        "{:.1} / {:.1} MB · {:.1} MB/s",
+                        fetch::mb(st.done),
+                        fetch::mb(st.total),
+                        fetch::mb(st.speed)
+                    )))
+            });
+            let (tag, tag_col) = tags[i];
+            let card_el = div()
+                .id(SharedString::from(format!("wc-{id}")))
+                .w_full()
+                .px(px(18.))
+                .py(px(14.))
+                .rounded(px(14.))
+                .bg(rgb(0xFFFFFF))
+                .border_2()
+                .border_color(rgb(if picked && step == 0 && !inst { GREEN } else { 0xFFFFFF }))
+                .flex()
+                .flex_col()
+                .when(!locked, |d| d.cursor_pointer())
+                .when(!locked, |d| {
+                    d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.fetch_pick[i] = !this.fetch_pick[i];
+                        cx.notify();
+                    }))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(14.))
+                        .child(
+                            div()
+                                .size(px(40.))
+                                .flex_shrink_0()
+                                .rounded(px(10.))
+                                .bg(rgb(0xE7F7EE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(icons[i]).size(px(20.)).text_color(rgb(GREEN))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT)).child(*name))
+                                        .child(
+                                            div()
+                                                .px(px(6.))
+                                                .rounded(px(4.))
+                                                .border_1()
+                                                .border_color(rgb(tag_col))
+                                                .text_size(px(11.))
+                                                .text_color(rgb(tag_col))
+                                                .child(tag),
+                                        ),
+                                )
+                                .child(div().text_size(px(12.)).line_height(px(18.)).text_color(rgb(TEXT2)).child(*desc)),
+                        )
+                        .child(div().flex_shrink_0().child(right)),
+                )
+                .when_some(bar, |d, b| d.child(b));
+            cards = cards.child(card_el);
+        }
+
+        // 配置这一步（下载完自动做）
+        let setup = &job.items[3];
+        let setup_line = (step != 0).then(|| {
+            let (t, col) = match setup.stage.as_str() {
+                "run" => ("正在启动引擎服务、把 MinIME 加进 fcitx5…", TEXT2),
+                "done" => ("引擎服务已启动，MinIME 已加进 fcitx5", GREEN),
+                _ if job.running => ("下载完会自动启动引擎服务、把 MinIME 加进 fcitx5", TEXT2),
+                _ => ("", TEXT2),
+            };
+            div().text_size(px(13.)).text_color(rgb(col)).child(t)
+        });
+
+        // 按钮
+        let todo = self.fetch_todo();
+        let mb_total: u32 = todo.iter().map(|&i| [218u32, 78, 103][i]).sum();
+        let mut actions = div().flex().items_center().gap(px(12.));
+        match (step, failed) {
+            (0, _) => {
+                let label = if todo.is_empty() { "配置".to_string() } else { format!("开始下载（约 {mb_total} MB）") };
+                actions = actions
+                    .child(
+                        Button::new("w-start")
+                            .label(label)
+                            .primary()
+                            .disabled(fetch::fetch_bin().is_none())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_fetch(cx))),
+                    )
+                    .child(Button::new("w-later").label("稍后再说").ghost().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.welcome = false;
+                        cx.notify();
+                    })));
+            }
+            (1, _) => {
+                actions = actions.child(
+                    Button::new("w-cancel").label("取消").outline().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_fetch(cx))),
+                );
+            }
+            (_, false) => {
+                actions = actions.child(Button::new("w-done").label("开始使用").primary().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.welcome = false;
+                    this.page = Page::Input;
+                    cx.notify();
+                })));
+            }
+            (_, true) => {
+                actions = actions
+                    .child(Button::new("w-retry").label("重试").primary().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start_fetch(cx))))
+                    .child(Button::new("w-back").label("返回").ghost().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.fetch_job = fetch::Job::default();
+                        cx.notify();
+                    })));
+            }
+        }
+
+        let mut logs = div().flex().flex_col().gap(px(3.));
+        if step == 2 {
+            for l in &job.logs {
+                logs = logs.child(div().text_size(px(12.)).text_color(rgb(TEXT2)).child(l.clone()));
+            }
+        }
+        let big = match (step, failed) {
+            (2, false) => Some(icon("icons/circle-check.svg").size(px(44.)).text_color(rgb(GREEN))),
+            (2, true) => Some(icon("icons/circle-alert.svg").size(px(44.)).text_color(rgb(RED))),
+            _ => None,
+        };
+        let missing_bin = fetch::fetch_bin().is_none();
+
+        let scroll = div().id("welcome").size_full().bg(rgb(PAGE_BG)).overflow_y_scroll().flex().justify_center().child(
+            div()
+                .w_full()
+                .max_w(px(600.))
+                .px(px(28.))
+                .pt(px(40.))
+                .pb(px(32.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(18.))
+                .child(big.map(|b| b.into_any_element()).unwrap_or_else(|| logo.into_any_element()))
+                .child(div().text_size(px(26.)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT)).child(title))
+                .child(div().text_size(px(14.)).line_height(px(22.)).text_color(rgb(if failed { RED } else { TEXT2 })).text_center().child(sub))
+                .child(steps)
+                .child(cards)
+                .when_some(setup_line, |d, l| d.child(l))
+                .when(missing_bin, |d| d.child(div().text_size(px(13.)).text_color(rgb(RED)).child("没有找到 minime-fetch：MinIME 的软件包可能没装完整")))
+                .child(actions)
+                .child(logs)
+                .child(
+                    div()
+                        .pt(px(6.))
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(rgb(0x9AA0A6))
+                        .text_center()
+                        .child("这些文件属于腾讯，MinIME 不分发；从腾讯官方下载地址下载，校验后只保存在本机（~/.local/share/minime/official）。"),
+                ),
+        );
+        div().size_full().flex().child(scroll)
+    }
+
+    fn page_models(&self, cx: &mut Context<Self>) -> Div {
         let model_title = |name: &str| {
             let (t, _) = dicts::model_info(name);
             let short = name.trim_end_matches(".bin");
@@ -1763,7 +2173,7 @@ impl Settings {
                 }
             } else {
                 e2e_card = e2e_card.child(
-                    div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("还没有下载整句模型：在终端运行 minime-fetch e2e，然后重启引擎。"),
+                    div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("还没有下载整句模型：到「模型」页下载。"),
                 );
             }
         }
@@ -1821,7 +2231,9 @@ impl Settings {
                 .text_color(rgb(TEXT2))
                 .child("模型负责给候选打分和排序。整句模型由「输入」页的整句候选开关控制。"),
         );
-        page.child(section_title("整句模型"))
+        page.child(section_title("官方文件"))
+            .child(self.official_card(cx))
+            .child(section_title("整句模型"))
             .child(e2e_card)
             .child(section_title("引擎内置模型"))
             .child(core)
@@ -2087,6 +2499,31 @@ impl Settings {
                     ))),
             )
             .child(cells);
+        // 引擎还没运行过（刚下载完、或者还没下载）：核心词库的加载情况是引擎启动时写的，这时没有
+        if self.core_state.is_empty() {
+            let (msg, show_btn) = if fetch::installed("engine") || engine_running() {
+                ("引擎启动后，这里会列出它加载的核心词库（输入方案、扩展词库等）。", false)
+            } else {
+                ("还没有下载官方引擎。下载并启动引擎后，这里会列出它加载的核心词库。", true)
+            };
+            page = page.child(section_title("核心词库")).child(
+                card().child(row(
+                    "核心词库",
+                    Some(msg.into()),
+                    if show_btn {
+                        Button::new("dict-fetch")
+                            .label("下载")
+                            .small()
+                            .primary()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_welcome(cx)))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    },
+                    true,
+                )),
+            );
+        }
         let titles = [
             (dicts::Group::Scheme, "输入方案"),
             (dicts::Group::Extra, "扩展词库"),
@@ -2289,6 +2726,12 @@ impl Render for Settings {
                     ),
                 )
             });
+        // 第一次运行：引导页盖住侧栏和设置页
+        let body = if self.welcome {
+            self.welcome_view(cx).font_family(self.ui_font.clone()).rounded_bl(radii.bottom_left).rounded_br(radii.bottom_right)
+        } else {
+            body
+        };
         window_border().child(
             div()
                 .size_full()

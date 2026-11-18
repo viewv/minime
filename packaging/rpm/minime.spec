@@ -3,7 +3,7 @@
 # 构建时 cargo 要联网取依赖；Rust 需要较新的 stable（发行版自带的太旧时用 rustup）。
 
 Name:           minime
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Native Linux fcitx5 input method running the WeType engine
 License:        MPL-2.0
@@ -64,6 +64,9 @@ MSG
 %{_datadir}/applications/minime-settings.desktop
 
 %changelog
+* Wed Nov 18 2026 MinIME contributors - 0.1.4-1
+- First-run setup wizard in the settings app: choose files, download with progress, configure
+- minime-fetch --json event stream for the settings app
 * Tue Nov 17 2026 MinIME contributors - 0.1.3-1
 - Add minime-uninstall (per-user cleanup) and make uninstall
 - Settings app draws its own title bar on desktops without server-side decorations (GNOME)
