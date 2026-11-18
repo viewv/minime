@@ -390,7 +390,15 @@ E2EBackend *e2e_cpu_new(const E2EWeights *w, int threads, char *err, size_t errl
 {
     __builtin_cpu_init();
     if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c")) {
-        snprintf(err, errlen, "CPU 不支持 AVX2/FMA/F16C");
+        if (err && errlen) {
+            static const char msg[] = "CPU 不支持 AVX2/FMA/F16C";
+            size_t i = 0;
+            while (i + 1 < errlen && msg[i]) {
+                err[i] = msg[i];
+                i++;
+            }
+            err[i] = '\0';
+        }
         return NULL;
     }
     return cpu_alloc(w, threads);
