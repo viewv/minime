@@ -40,8 +40,8 @@ native:
 	for f in shaders/*.comp; do glslc -O --target-env=vulkan1.1 -mfmt=c -o $(BUILD)/native/shaders/`basename $$f .comp`.spv.h $$f || exit 1; done
 	gcc $(E2EBASEFLAGS) -I$(BUILD)/native/shaders -c -o $(BUILD)/native/e2e_vk.o e2e_vk.c
 	[ ! -f host.c ] || gcc $(NCFLAGS) -o $(BUILD)/native/host host.c $(LOADER) -lpthread   # 调试用宿主（公开仓库里没有）
-	gcc $(NCFLAGS) -o $(BUILD)/native/engined engined.c engine.c netcompat.c tflite_trace.c $(E2EOBJS) $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
-	gcc $(NCFLAGS) -o $(BUILD)/native/userdata userdata.c engine.c tflite_trace.c $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
+	gcc $(NCFLAGS) -o $(BUILD)/native/engined engined.c engine.c netcompat.c $(wildcard tflite_trace.c) $(E2EOBJS) $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
+	gcc $(NCFLAGS) -o $(BUILD)/native/userdata userdata.c engine.c $(wildcard tflite_trace.c) $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
 	gcc $(NCFLAGS) -o $(BUILD)/native/e2e_cli e2e_cli.c $(E2EOBJS) -lpthread -lm -ldl
 	gcc $(NCFLAGS) -o $(BUILD)/native/e2e_test e2e_test.c $(E2EOBJS) -lpthread -lm -ldl
 

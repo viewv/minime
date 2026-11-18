@@ -246,8 +246,9 @@ int wx_engine_open(const char *install_dir, const char *work_dir_in)
     }
 #ifndef _WIN32
     if (getenv("MINIME_TFLITE_TRACE")) {
-        void tflite_trace_install(pe_module *eng);
-        tflite_trace_install(h);
+        __attribute__((weak)) void tflite_trace_install(pe_module *eng);
+        if (tflite_trace_install)
+            tflite_trace_install(h);
     }
 #endif
 
