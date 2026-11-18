@@ -6,6 +6,7 @@ After=graphical-session.target
 ExecStart=/usr/bin/minime-netd
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

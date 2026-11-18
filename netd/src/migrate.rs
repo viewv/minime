@@ -1,6 +1,6 @@
 //! 换机助手（设备迁移）：本机出码，手机「换机助手 → 扫一扫」，双方互换用户数据。
 //!
-//! 协议见 开发笔记（未公开） 附录 E、开发笔记（未公开）。不需要关联设备，也不需要登录。
+//! 协议见 docs/cross-device.md 附录 E、docs/cross-device.md。不需要关联设备，也不需要登录。
 //!
 //! ```text
 //! 50 ×2（出码，用第二个 id）→ 51 轮询 ──被扫──> state 2（出现上传槽 field3 + 会话密钥 field5）
@@ -163,7 +163,14 @@ pub async fn engined_ctl(line: &str) -> Res<()> {
 
 /// 让 engined 导出/导入用户数据：`verb` = export | import。
 pub async fn engine(verb: &str, path: &Path, key: &str) -> Res<()> {
-    engined_ctl(&format!("{verb} {} {key}", path.display()))
+    if key.len() != 32 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("无效的迁移会话密钥".into());
+    }
+    let p = path.to_string_lossy();
+    if p.contains([' ', '\n', '\r']) {
+        return Err("迁移路径包含非法空白字符".into());
+    }
+    engined_ctl(&format!("{verb} {p} {key}"))
         .await
         .map_err(|e| format!("引擎 {verb} 失败：{e}").into())
 }
@@ -172,15 +179,19 @@ pub async fn engine(verb: &str, path: &Path, key: &str) -> Res<()> {
 
 /// 解开手机的包：(设置, 引擎数据)
 fn unpack(zip: &[u8]) -> Res<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    const MAX_ENTRY: usize = 64 << 20;
     let mut z = zip::ZipArchive::new(Cursor::new(zip))?;
     let mut get = |name: &str| -> Res<Option<Vec<u8>>> {
         match z.by_name(name) {
-            Ok(mut f) => {
-                if f.size() > 64 << 20 {
+            Ok(f) => {
+                if f.size() > MAX_ENTRY as u64 {
                     return Err(format!("{name} 过大").into());
                 }
                 let mut v = Vec::new();
-                f.read_to_end(&mut v)?;
+                f.take((MAX_ENTRY + 1) as u64).read_to_end(&mut v)?;
+                if v.len() > MAX_ENTRY {
+                    return Err(format!("{name} 解压后过大").into());
+                }
                 Ok(Some(v))
             }
             Err(zip::result::ZipError::FileNotFound) => Ok(None),
@@ -269,7 +280,7 @@ pub async fn run(s: Arc<Session>, http: reqwest::Client, reply: UnboundedSender<
         if !i.put.is_empty() {
             put = i.put.clone();
         }
-        if i.key.len() == 32 {
+        if i.key.len() == 32 && i.key.bytes().all(|b| b.is_ascii_hexdigit()) {
             key = i.key.clone();
         }
         if finishing.is_none() && matches!(i.state, 5 | 6) && scanned.is_some() {

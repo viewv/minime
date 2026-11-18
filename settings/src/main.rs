@@ -200,6 +200,10 @@ struct Settings {
     /// 后台服务的状态（systemctl is-active），在「关于」页每两秒刷新一次
     svc: [String; 3],
     svc_at: Option<Instant>,
+    svc_rx: Option<mpsc::Receiver<[String; 3]>>,
+    svc_op_rx: Option<mpsc::Receiver<(String, bool)>>,
+    conf_mtime: Option<std::time::SystemTime>,
+    hot_seq: u64,
     /// 第一次运行的引导页（整窗显示，盖住侧栏和设置页）
     welcome: bool,
     /// 官方文件下载（minime-fetch --json）
@@ -305,6 +309,10 @@ impl Settings {
             dict_error: None,
             svc: Default::default(),
             svc_at: None,
+            svc_rx: None,
+            svc_op_rx: None,
+            conf_mtime: conf_mtime(),
+            hot_seq: 0,
             migrate: Migrate::Idle,
             migrate_rx: None,
             migrate_cancel: None,
@@ -345,12 +353,14 @@ impl Settings {
                     self.pair_rx = None;
                     self.pair_cancel = None;
                     let _ = self.kick.send(());
+                    break;
                 }
                 "error" => {
                     let m = v["message"].as_str().unwrap_or("关联失败").to_string();
                     self.pairing = if self.entering { Pairing::EnterCode(Some(m)) } else { Pairing::Failed(m) };
                     self.pair_rx = None;
                     self.pair_cancel = None;
+                    break;
                 }
                 _ => {}
             }
@@ -388,13 +398,36 @@ impl Settings {
                 dirty = true; // 转圈提示
             }
         }
-        if self.page == Page::About && self.svc_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(2)) {
-            self.svc_at = Some(Instant::now());
-            let st = service_states();
-            if st != self.svc {
-                self.svc = st;
+        if let Some(rx) = &self.svc_rx {
+            if let Ok(st) = rx.try_recv() {
+                self.svc_rx = None;
+                if st != self.svc {
+                    self.svc = st;
+                    dirty = true;
+                }
+            }
+        }
+        if let Some(rx) = &self.svc_op_rx {
+            if let Ok((msg, ok)) = rx.try_recv() {
+                self.svc_op_rx = None;
+                self.toast = Some((msg.into(), ok, Instant::now()));
+                self.svc_at = None;
                 dirty = true;
             }
+        }
+        if self.page == Page::About && self.svc_rx.is_none() && self.svc_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(2)) {
+            self.svc_at = Some(Instant::now());
+            let (tx, rx) = mpsc::channel();
+            self.svc_rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(service_states());
+            });
+        }
+        let cm = conf_mtime();
+        if cm != self.conf_mtime {
+            self.conf_mtime = cm;
+            self.ini = conf::Ini::load();
+            dirty = true;
         }
         let dm = dict_mtimes();
         if dm != self.dict_mtime {
@@ -449,7 +482,11 @@ impl Settings {
                 dirty = true;
             }
         }
-        if matches!(self.pairing, Pairing::ShowCode { .. }) {
+        if let Pairing::ShowCode { until, .. } = &self.pairing {
+            if Instant::now() >= *until {
+                self.cancel_pair();
+                self.pairing = Pairing::Failed("配对码已过期".into());
+            }
             dirty = true; // 倒计时
         }
         if let Some((_, _, t)) = &self.toast {
@@ -465,6 +502,7 @@ impl Settings {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         self.save_error = self.ini.save().err().map(|e| format!("保存失败：{e}"));
+        self.conf_mtime = conf_mtime();
         let _ = self.kick.send(());
         cx.notify();
     }
@@ -653,12 +691,14 @@ fn section_title(t: &'static str) -> Div {
 /// 一行：标题 + 说明（可选） + 右侧控件；`last` 的行不画分隔线。
 /// 离线语音服务的状态（说明文字, 颜色）
 fn asr_status() -> (String, u32) {
-    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let rt = std::env::var("XDG_RUNTIME_DIR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/tmp".into());
     // 只看 socket 在不在（systemd 按需启动时由它持有）；不能去连，连一下就会把服务拉起来
     let running = std::path::Path::new(&format!("{rt}/minime-asrd.sock")).exists();
     let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
     let model = std::fs::read_dir(data.join("minime/asr/model"))
         .map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".xnet")))
         .unwrap_or(false);
@@ -924,16 +964,25 @@ impl Settings {
         d
     }
 
-    /// 快捷键预设（fcitx5 的 KeyList 存成 [段] 0=…）
+    /// 快捷键预设（fcitx5 的 KeyList 存成 [段] 0=…；空段表示“不使用”）
     fn key_picker(&self, section: &'static str, default: &str, opts: &'static [(&'static str, &'static str)], cx: &mut Context<Self>) -> Div {
-        let cur = self.ini.get(section, "0").unwrap_or_else(|| default.into());
+        let cur = if let Some(v) = self.ini.get(section, "0") {
+            v
+        } else if self.ini.has_section(section) {
+            String::new()
+        } else {
+            default.into()
+        };
         let mut d = div().flex().items_center().gap(px(6.));
         for (i, (val, label)) in opts.iter().enumerate() {
             let val: &'static str = val;
             let b = Button::new(SharedString::from(format!("{section}-{i}"))).label(*label).small();
             let b = if cur == val { b.primary() } else { b.outline() };
             d = d.child(b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.ini.set(section, "0", val);
+                this.ini.clear_section(section);
+                if !val.is_empty() {
+                    this.ini.set(section, "0", val);
+                }
                 this.save(cx);
             })));
         }
@@ -1378,27 +1427,35 @@ impl Settings {
             })
     }
 
-    /// 重启一个后台服务（不等结果；状态在下一次刷新里看得到）
+    /// 重启一个后台服务（后台执行 systemctl，完成后发 toast 并刷新状态）
     fn restart_service(&mut self, unit: &'static str, name: &'static str, cx: &mut Context<Self>) {
         if unit == "minime-engined.service" {
             self.restart_engine(cx); // 复用词库页的重启：等引擎重新写状态文件再提示
             return;
         }
         // 离线语音由 socket 按需拉起：停掉正在跑的识别进程即可，socket 保持监听
-        let args: &[&str] = if unit == "minime-asrd.socket" {
-            &["--user", "stop", "minime-asrd.service"]
+        let args: Vec<&'static str> = if unit == "minime-asrd.socket" {
+            vec!["--user", "stop", "minime-asrd.service"]
         } else {
-            &["--user", "restart", unit]
+            vec!["--user", "restart", unit]
         };
-        let ok = std::process::Command::new("systemctl")
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        self.toast = Some(if ok { (format!("已重启{name}"), true, Instant::now()) } else { (format!("{name}重启失败（journalctl --user -u {unit}）"), false, Instant::now()) });
-        self.svc_at = None;
+        let (tx, rx) = mpsc::channel();
+        self.svc_op_rx = Some(rx);
+        std::thread::spawn(move || {
+            let ok = std::process::Command::new("systemctl")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let msg = if ok {
+                format!("已重启{name}")
+            } else {
+                format!("{name}重启失败（journalctl --user -u {unit}）")
+            };
+            let _ = tx.send((msg, ok));
+        });
         cx.notify();
     }
 
@@ -1471,8 +1528,10 @@ impl Settings {
 /// minime-fetch 把官方文件放在这里（~/.local/share/minime/official）
 fn official_dir() -> std::path::PathBuf {
     let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
     data.join("minime/official")
 }
 
@@ -1511,6 +1570,10 @@ fn service_states() -> [String; 3] {
             .unwrap_or(false);
         if installed { st } else { "missing".into() }
     })
+}
+
+fn conf_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(conf::path()).and_then(|m| m.modified()).ok()
 }
 
 fn dict_mtimes() -> Vec<Option<std::time::SystemTime>> {
@@ -1585,7 +1648,14 @@ impl Settings {
                     h.text = text;
                 }
             }
-            None => items.push(minime_netd::hotwords::HotWord { key, text, ..Default::default() }),
+            None => {
+                self.hot_seq += 1;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                items.push(minime_netd::hotwords::new_item(&key, &text, now + self.hot_seq));
+            }
         }
         self.hot_error = None;
         self.hot_key.update(cx, |s, cx| s.set_value("", window, cx));
@@ -1722,8 +1792,8 @@ impl Settings {
 
     /// 核心词库的配置比引擎上次启动时新：要重启引擎才生效
     fn core_pending(&self) -> bool {
-        // 按内容比：当前配置和引擎上次启动实际用的配置不一样，就是有改动待生效
-        !self.core_state.is_empty() && self.core_conf != dicts::conf_from_state(&self.core_state)
+        // 按有效内容比：当前配置和引擎上次启动实际用的配置不一样，就是有改动待生效
+        !self.core_state.is_empty() && self.core_conf.effective() != dicts::conf_from_state(&self.core_state)
     }
 
     fn discard_core_changes(&mut self, cx: &mut Context<Self>) {
@@ -1733,13 +1803,15 @@ impl Settings {
     }
 
     fn restart_engine(&mut self, cx: &mut Context<Self>) {
-        let ok = std::process::Command::new("systemctl")
+        let child = std::process::Command::new("systemctl")
             .args(["--user", "restart", "minime-engined"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok();
-        if ok {
+            .spawn();
+        if let Ok(mut child) = child {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             let m = std::fs::metadata(dicts::dir().join("core_state.tsv")).and_then(|m| m.modified()).ok();
             self.restarting = Some((Instant::now(), m));
         } else {
@@ -1784,7 +1856,7 @@ impl Settings {
         let todo: Vec<&str> = fetch::ITEMS
             .iter()
             .enumerate()
-            .filter(|(i, (id, ..))| !fetch::installed(id) && self.fetch_pick[*i])
+            .filter(|(i, (id, ..))| !fetch::ready(id).0 && (*i == 0 || self.fetch_pick[*i]))
             .map(|(_, (id, ..))| *id)
             .collect();
         let (tx, rx) = mpsc::channel();
@@ -1802,21 +1874,21 @@ impl Settings {
     }
 
     fn cancel_fetch(&mut self, cx: &mut Context<Self>) {
-        if let Some(mut c) = self.fetch_child.take() {
-            fetch::cancel(&mut c);
+        if let Some(c) = self.fetch_child.take() {
+            fetch::cancel(c);
         }
         self.fetch_rx = None;
         self.fetch_job.running = false;
         self.fetch_job.finished = true;
         self.fetch_job.ok = false;
-        self.fetch_job.error = Some("已取消。再点一次会接着下载没完成的部分".into());
+        self.fetch_job.error = Some("已取消。已完成的项目会保留，未完成的需要重新下载".into());
         cx.notify();
     }
 
     /// 要下载的项（没装、而且选了；引擎总是选上）
     fn fetch_todo(&self) -> Vec<usize> {
         (0..fetch::ITEMS.len())
-            .filter(|&i| !fetch::installed(fetch::ITEMS[i].0) && (i == 0 || self.fetch_pick[i]))
+            .filter(|&i| !fetch::ready(fetch::ITEMS[i].0).0 && (i == 0 || self.fetch_pick[i]))
             .collect()
     }
 
@@ -1832,20 +1904,39 @@ impl Settings {
     fn official_card(&self, cx: &mut Context<Self>) -> Div {
         let mut c = card();
         let n = fetch::ITEMS.len();
+        let mut dev = false;
         for (i, (id, name, _, size)) in fetch::ITEMS.iter().enumerate() {
-            let inst = fetch::installed(id);
-            let (t, col) = if inst {
+            let (inst, other) = fetch::ready(id);
+            dev |= other.is_some();
+            let (t, col) = if other.is_some() {
+                ("已就绪", GREEN)
+            } else if inst {
                 ("已下载", GREEN)
             } else if *id == "engine" {
                 ("未下载（必需）", RED)
             } else {
                 ("未下载", TEXT2)
             };
-            let desc: SharedString = if inst { fetch::ITEMS[i].2.into() } else { format!("下载{size}").into() };
+            let desc: SharedString = if let Some(d) = &other {
+                format!("引擎服务在用 {}（不是从这里下载的）", d.display()).into()
+            } else if inst {
+                fetch::ITEMS[i].2.into()
+            } else {
+                format!("下载{size}").into()
+            };
             c = c.child(row(*name, Some(desc), div().text_size(px(13.)).text_color(rgb(col)).child(t), false));
             let _ = n;
         }
-        let missing = fetch::ITEMS.iter().filter(|(id, ..)| !fetch::installed(id)).count();
+        let missing = fetch::ITEMS.iter().filter(|(id, ..)| !fetch::ready(id).0).count();
+        // 引擎来自别处（开发环境）：minime-fetch setup 只认下载目录，「重新配置」会失败，不给按钮
+        if missing == 0 && dev && !fetch::installed("engine") {
+            return c.child(row(
+                "下载与配置",
+                Some("文件都已就绪：引擎服务用的是开发目录里的文件，不需要下载".into()),
+                div(),
+                true,
+            ));
+        }
         let (label, desc) = if self.fetch_job.running {
             ("查看进度", "正在下载")
         } else if missing > 0 {
@@ -1917,7 +2008,7 @@ impl Settings {
         let tags = [("必需", RED), ("推荐", GREEN), ("可选", TEXT2)];
         let mut cards = div().w_full().flex().flex_col().gap(px(10.));
         for (i, (id, name, desc, size)) in fetch::ITEMS.iter().enumerate() {
-            let inst = fetch::installed(id);
+            let inst = fetch::ready(id).0;
             let st = &job.items[i];
             let picked = inst || i == 0 || self.fetch_pick[i];
             let locked = inst || i == 0 || step != 0;
@@ -1950,7 +2041,7 @@ impl Settings {
                     .child(mark)
                     .into_any_element()
             };
-            let bar = (st.stage == "download" && st.total > 0).then(|| {
+            let bar = (step == 1 && st.stage == "download" && st.total > 0).then(|| {
                 let frac = (st.done as f32 / st.total as f32).clamp(0., 1.);
                 div()
                     .pt(px(10.))
@@ -2159,8 +2250,8 @@ impl Settings {
             e2e_card = e2e_card.child(dict_row("icons/cpu.svg", model_title(&p.name), meta, Some(status), div(), i + 1 < n));
         }
         if n == 0 {
-            // 库房里没有（普通用户都是这样）：显示 minime-fetch 下载的模型
-            let dir = official_dir().join("mac/imeData");
+            // 库房里没有（普通用户都是这样）：显示正在使用的整句模型目录（e2e_dir_in_use → 默认下载目录）
+            let dir = fetch::e2e_dir_in_use().unwrap_or_else(|| official_dir().join("mac/imeData"));
             let files: Vec<(&str, u64)> = ["decgnr.bin", "mpd_e2e.bin"]
                 .iter()
                 .filter_map(|f| std::fs::metadata(dir.join(f)).ok().map(|m| (*f, m.len())))
@@ -2173,7 +2264,7 @@ impl Settings {
                 }
             } else {
                 e2e_card = e2e_card.child(
-                    div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("还没有下载整句模型：到「模型」页下载。"),
+                    div().py(px(18.)).text_size(px(13.)).text_color(rgb(TEXT2)).child("还没有下载整句模型：请运行 minime-fetch 或通过欢迎引导下载。"),
                 );
             }
         }

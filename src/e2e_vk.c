@@ -77,6 +77,8 @@ typedef struct {
     void *map;
 } Buf;
 
+typedef struct { const uint16_t *qkvb, *ob, *upb, *downb; } Bias16;
+
 typedef struct {
     E2EBackend base;
     const E2EWeights *w;
@@ -113,6 +115,7 @@ typedef struct {
     int nts, ts_kind[512];
     double gpu_ns[8], host_ms, wait_ms, rec_ms, submit_ms;
     long ncalls, ndisp[8];
+    Bias16 bias16[NL];
 } Vk;
 
 /* ---------- 内存 ---------- */
@@ -128,6 +131,7 @@ static int find_mem(Vk *v, uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPr
 }
 
 enum { MEM_DEVICE, MEM_UPLOAD, MEM_READBACK };
+static void buf_free(Vk *v, Buf *b);
 static int buf_new(Vk *v, Buf *b, VkDeviceSize size, VkBufferUsageFlags usage, int host)
 {
     memset(b, 0, sizeof(*b));
@@ -144,16 +148,22 @@ static int buf_new(Vk *v, Buf *b, VkDeviceSize size, VkBufferUsageFlags usage, i
            : host == MEM_READBACK ? find_mem(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                                              VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
            : find_mem(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    if (mt < 0)
+    if (mt < 0) {
+        buf_free(v, b);
         return -1;
+    }
     VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
                                 .memoryTypeIndex = (uint32_t)mt };
-    if (v->vkAllocateMemory(v->dev, &ai, NULL, &b->mem) != VK_SUCCESS)
+    if (v->vkAllocateMemory(v->dev, &ai, NULL, &b->mem) != VK_SUCCESS) {
+        buf_free(v, b);
         return -1;
+    }
     v->vkBindBufferMemory(v->dev, b->buf, b->mem, 0);
     b->size = size;
-    if (host && v->vkMapMemory(v->dev, b->mem, 0, size, 0, &b->map) != VK_SUCCESS)
+    if (host && v->vkMapMemory(v->dev, b->mem, 0, size, 0, &b->map) != VK_SUCCESS) {
+        buf_free(v, b);
         return -1;
+    }
     return 0;
 }
 
@@ -240,8 +250,10 @@ static int vk_reserve(E2EBackend *b, int nslots)
         return -1;
     if (v->cap) {
         CopyArg c = { v->kv.buf, nb.buf, SLOT_BYTES * (VkDeviceSize)v->cap };
-        if (run_once(v, rec_copy, &c) < 0)
+        if (run_once(v, rec_copy, &c) < 0) {
+            buf_free(v, &nb);
             return -1;
+        }
         buf_free(v, &v->kv);
     }
     v->kv = nb;
@@ -292,11 +304,6 @@ static void mm_q4(Vk *v, const E2EQMat *m, const uint16_t *bias16, uint32_t xoff
 
 typedef struct { const E2EBatch *bt; } FwdArg;
 
-/* 偏置在 E2EWeights 里是转好的 fp32 副本；着色器直接读文件里的 fp16，所以要找回文件里的位置：
- * 偏置张量在文件里紧挨在 bias 名字对应的张量处——这里简单起见，由 e2e_vk_new 预先记下来 */
-typedef struct { const uint16_t *qkvb, *ob, *upb, *downb; } Bias16;
-static Bias16 g_bias16[NL];
-
 static void rec_forward(Vk *v, void *a)
 {
     const E2EBatch *bt = ((FwdArg *)a)->bt;
@@ -314,14 +321,14 @@ static void rec_forward(Vk *v, void *a)
         const E2ELayer *L = &w->L[l];
         uint32_t ln1[5] = { A_X, 0, A_HN, woff(v, L->ln1w), woff(v, L->ln1b) };
         dispatch(v, P_LN, ln1, 5, (uint32_t)B, 1);
-        mm_q4(v, &L->qkv, g_bias16[l].qkvb, A_HN, A_QKV, B, 3, l);          /* mode 3：顺带把 K、V 写进槽位 */
+        mm_q4(v, &L->qkv, v->bias16[l].qkvb, A_HN, A_QKV, B, 3, l);          /* mode 3：顺带把 K、V 写进槽位 */
         uint32_t at[3] = { (uint32_t)l, A_QKV, A_ATT };
         dispatch(v, P_ATTN, at, 3, (uint32_t)B, 12);
-        mm_q4(v, &L->o, g_bias16[l].ob, A_ATT, A_X, B, 1, 0);
+        mm_q4(v, &L->o, v->bias16[l].ob, A_ATT, A_X, B, 1, 0);
         uint32_t ln2[5] = { A_X, 0, A_HN, woff(v, L->ln2w), woff(v, L->ln2b) };
         dispatch(v, P_LN, ln2, 5, (uint32_t)B, 1);
-        mm_q4(v, &L->up, g_bias16[l].upb, A_HN, A_UP, B, 2, 0);
-        mm_q4(v, &L->down, g_bias16[l].downb, A_UP, A_X, B, 1, 0);
+        mm_q4(v, &L->up, v->bias16[l].upb, A_HN, A_UP, B, 2, 0);
+        mm_q4(v, &L->down, v->bias16[l].downb, A_UP, A_X, B, 1, 0);
     }
     int nl = B - bt->logits_from;
     if (nl > 0) {
@@ -393,9 +400,9 @@ static void vk_destroy(E2EBackend *b)
                     v->gpu_ns[i] / 1e6 / v->ncalls, 100 * v->gpu_ns[i] / (tot + 1), v->ndisp[i],
                     v->ndisp[i] ? v->gpu_ns[i] / 1e3 / v->ndisp[i] : 0);
     }
-    if (v->qp) v->vkDestroyQueryPool(v->dev, v->qp, NULL);
     if (v->dev) {
         v->vkDeviceWaitIdle(v->dev);
+        if (v->qp) v->vkDestroyQueryPool(v->dev, v->qp, NULL);
         for (int i = 0; i < P_COUNT; i++)
             if (v->pipe[i]) v->vkDestroyPipeline(v->dev, v->pipe[i], NULL);
         for (int i = 0; i < NVAR; i++) {
@@ -606,7 +613,7 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
 
     for (int l = 0; l < NL; l++) {
         char nm[64];
-#define B16(f, s) (snprintf(nm, sizeof nm, s ".%d", l), g_bias16[l].f = find_f16(p, nm))
+#define B16(f, s) (snprintf(nm, sizeof nm, s ".%d", l), v->bias16[l].f = find_f16(p, nm))
         if (!B16(qkvb, "attention.qkv_proj.bias") || !B16(ob, "attention.o_proj.bias") ||
             !B16(upb, "mlp.up_proj.bias") || !B16(downb, "mlp.down_proj.bias"))
             FAIL("找不到第 %d 层偏置", l);

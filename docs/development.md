@@ -32,7 +32,7 @@ make netd settings asrd  # Rust 组件
 
 ```bash
 python3 scripts/minime-fetch                          # 下载官方文件（只需一次）
-scripts/install_engined.sh                            # 引擎服务
+scripts/install_engined.sh                            # 引擎服务（单元文件和软件包的一样，只换程序路径）
 scripts/install_fcitx5_addon.sh                       # fcitx5 插件（需要 sudo）
 scripts/install_netd.sh && scripts/install_asrd.sh && scripts/install_settings.sh
 ```

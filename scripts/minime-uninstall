@@ -143,6 +143,11 @@ def main(argv):
     if any(a in ("-h", "--help") for a in argv):
         print(__doc__)
         return 0
+    known = {"-h", "--help", "--dry-run", "--keep-data", "-y", "--yes"}
+    unknown = [a for a in argv if a not in known]
+    if unknown:
+        print("不认识的参数：%s（运行 minime-uninstall --help 查看用法）" % " ".join(unknown), file=sys.stderr)
+        return 2
     if os.geteuid() == 0:
         print("请以普通用户身份运行（不要加 sudo）：清理的是当前用户的服务和数据。", file=sys.stderr)
         return 1

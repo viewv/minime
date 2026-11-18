@@ -25,21 +25,23 @@ LOADER  := $(BUILD)/native/pe.o $(BUILD)/native/kernel32.o $(BUILD)/native/files
 # 分配器用 jemalloc（实测比 glibc 快约 7%，见 docs/engine.md）；没装就退回 glibc
 JEMALLOC := $(shell printf 'int main(void){return 0;}' | gcc -x c - -ljemalloc -o /dev/null 2>/dev/null && echo -ljemalloc)
 
-# e2e 整句模型（e2e.c）要 AVX2/FMA/F16C，只给它开这些指令；运行时 CPU 不支持就自动不启用
-E2EFLAGS := -O3 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11 -mavx2 -mfma -mf16c
+# 只有 CPU 后端（e2e_cpu.c）需要整个 TU 开启 AVX2/FMA/F16C；e2e.c / e2e_vk.c 用基线指令集，
+# e2e.c 内的 logsumexp AVX2 版本通过 target 属性在运行时按 __builtin_cpu_supports 分发，避免老 CPU 在检测前 SIGILL
+E2EBASEFLAGS := -O3 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11
+E2ECPUFLAGS  := $(E2EBASEFLAGS) -mavx2 -mfma -mf16c
 E2EOBJS  := $(BUILD)/native/e2e.o $(BUILD)/native/e2e_cpu.o $(BUILD)/native/e2e_vk.o
 
 native:
 	$(MAKE) -C ../loader objs
 	mkdir -p $(BUILD)/native
-	gcc $(E2EFLAGS) -c -o $(BUILD)/native/e2e.o e2e.c
-	gcc $(E2EFLAGS) -c -o $(BUILD)/native/e2e_cpu.o e2e_cpu.c
+	gcc $(E2EBASEFLAGS) -c -o $(BUILD)/native/e2e.o e2e.c
+	gcc $(E2ECPUFLAGS) -c -o $(BUILD)/native/e2e_cpu.o e2e_cpu.c
 	mkdir -p $(BUILD)/native/shaders
 	for f in shaders/*.comp; do glslc -O --target-env=vulkan1.1 -mfmt=c -o $(BUILD)/native/shaders/`basename $$f .comp`.spv.h $$f || exit 1; done
-	gcc $(E2EFLAGS) -I$(BUILD)/native/shaders -c -o $(BUILD)/native/e2e_vk.o e2e_vk.c
+	gcc $(E2EBASEFLAGS) -I$(BUILD)/native/shaders -c -o $(BUILD)/native/e2e_vk.o e2e_vk.c
 	[ ! -f host.c ] || gcc $(NCFLAGS) -o $(BUILD)/native/host host.c $(LOADER) -lpthread   # 调试用宿主（公开仓库里没有）
-	gcc $(NCFLAGS) -o $(BUILD)/native/engined engined.c engine.c netcompat.c $(E2EOBJS) $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
-	gcc $(NCFLAGS) -o $(BUILD)/native/userdata userdata.c engine.c $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
+	gcc $(NCFLAGS) -o $(BUILD)/native/engined engined.c engine.c netcompat.c tflite_trace.c $(E2EOBJS) $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
+	gcc $(NCFLAGS) -o $(BUILD)/native/userdata userdata.c engine.c tflite_trace.c $(LOADER) -lpthread -lm -ldl $(JEMALLOC)
 	gcc $(NCFLAGS) -o $(BUILD)/native/e2e_cli e2e_cli.c $(E2EOBJS) -lpthread -lm -ldl
 	gcc $(NCFLAGS) -o $(BUILD)/native/e2e_test e2e_test.c $(E2EOBJS) -lpthread -lm -ldl
 

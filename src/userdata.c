@@ -1,7 +1,7 @@
 /* userdata.c — 换机助手用户数据的导入/导出小工具（走本地引擎）
  *
  * 用途：检查 export_engine_file.bin，以及把手机迁移包里的引擎数据
- * import 进本地引擎。格式说明见 开发笔记（未公开）。
+ * import 进本地引擎。格式说明见 docs/cross-device.md。
  *
  *   userdata <安装目录> <工作目录> export <输出文件> <encrypt_key>
  *   userdata <安装目录> <工作目录> import <输入文件> <encrypt_key>

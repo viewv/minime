@@ -3,9 +3,17 @@
 set -e
 T=$(cd "$(dirname "$0")/.." && pwd)
 
+ADDON_DIR=$(pkg-config --variable=addondir Fcitx5Core 2>/dev/null || true)
+if [ -z "$ADDON_DIR" ]; then
+  for d in /usr/lib/x86_64-linux-gnu/fcitx5 /usr/lib64/fcitx5 /usr/lib/fcitx5; do
+    [ -d "$d" ] && { ADDON_DIR=$d; break; }
+  done
+fi
+ADDON_DIR=${ADDON_DIR:-/usr/lib/fcitx5}
+
 sudo install -Dm644 "$T/fcitx5-minime/minime-addon.conf" /usr/share/fcitx5/addon/minime.conf
 sudo install -Dm644 "$T/fcitx5-minime/minime-inputmethod.conf" /usr/share/fcitx5/inputmethod/minime.conf
-sudo install -Dm755 "$T/fcitx5-minime/build/libminime.so" /usr/lib/fcitx5/libminime.so
+sudo install -Dm755 "$T/fcitx5-minime/build/libminime.so" "$ADDON_DIR/libminime.so"
 
 # 系统安装路径下 Library 用裸名
 sudo sed -i 's|^Library=.*|Library=libminime|' /usr/share/fcitx5/addon/minime.conf

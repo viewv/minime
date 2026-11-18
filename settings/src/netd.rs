@@ -12,9 +12,14 @@ use serde_json::{json, Value};
 
 pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("MINIME_NETD_SOCKET") {
-        return PathBuf::from(p);
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
     }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/tmp".into());
     PathBuf::from(dir).join("minime-netd.sock")
 }
 
@@ -78,14 +83,22 @@ pub fn spawn_stream(cmd: String, tx: mpsc::Sender<Value>) -> Option<UnixStream> 
     std::thread::spawn(move || {
         let mut s = s;
         if s.write_all(format!("{cmd}\n").as_bytes()).is_err() {
+            let _ = tx.send(json!({"type": "error", "message": "发送命令失败，网络服务连接已断开"}));
             return;
         }
+        let mut done = false;
         for line in BufReader::new(s).lines().map_while(Result::ok) {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if matches!(v["type"].as_str(), Some("paired" | "migrated" | "error")) {
+                    done = true;
+                }
                 if tx.send(v).is_err() {
-                    break;
+                    return;
                 }
             }
+        }
+        if !done {
+            let _ = tx.send(json!({"type": "error", "message": "与网络服务的连接已断开"}));
         }
     });
     cancel

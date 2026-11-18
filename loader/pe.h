@@ -36,6 +36,9 @@ void pe_register_host_dll(const char *dll, void *(*lookup)(const char *name));
 /* 按名字找导出；找不到返回 NULL。 */
 void *pe_export(pe_module *m, const char *name);
 
+/* 把模块 m 从 dll 导入的 fn 换成 newfn（调试用）；返回原地址，没找到返回 NULL。 */
+void *pe_patch_import(pe_module *m, const char *dll, const char *fn, void *newfn);
+
 /* 按基址找模块（HMODULE 就是基址）。 */
 pe_module *pe_module_by_base(const void *base);
 pe_module *pe_module_by_name(const char *name);

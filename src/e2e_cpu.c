@@ -288,12 +288,15 @@ static int cpu_forward(E2EBackend *b, const E2EBatch *bt)
         c->vals = realloc(c->vals, sizeof(float *) * (size_t)maxctx);
         c->sc = realloc(c->sc, sizeof(float) * (size_t)maxctx);
     }
-    for (int i = 0; i < B; i++)
+    for (int i = 0; i < B; i++) {
+        if ((unsigned)bt->tok[i] >= V || (unsigned)bt->pos[i] >= E2E_PMAX)
+            return -1;
         for (int k = 0; k < H; k += 8) {
             __m256 a = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w->wte + (size_t)bt->tok[i] * H + k)));
             __m256 p = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w->wpe + (size_t)bt->pos[i] * H + k)));
             _mm256_storeu_ps(c->x + i * H + k, _mm256_add_ps(a, p));
         }
+    }
     for (int l = 0; l < NL; l++) {
         const E2ELayer *L = &w->L[l];
         for (int i = 0; i < B; i++)
@@ -350,13 +353,8 @@ static void cpu_destroy(E2EBackend *b)
     free(c);
 }
 
-E2EBackend *e2e_cpu_new(const E2EWeights *w, int threads, char *err, size_t errlen)
+static E2EBackend *cpu_alloc(const E2EWeights *w, int threads)
 {
-    __builtin_cpu_init();
-    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c")) {
-        snprintf(err, errlen, "CPU 不支持 AVX2/FMA/F16C");
-        return NULL;
-    }
     Cpu *c = calloc(1, sizeof(*c));
     c->base.name = "cpu";
     c->base.reserve = cpu_reserve;
@@ -385,4 +383,15 @@ E2EBackend *e2e_cpu_new(const E2EWeights *w, int threads, char *err, size_t errl
         pthread_create(&p->th[i], NULL, pool_main, &p->w[i]);
     }
     return &c->base;
+}
+
+__attribute__((target("no-avx,no-avx2,no-fma,no-f16c")))
+E2EBackend *e2e_cpu_new(const E2EWeights *w, int threads, char *err, size_t errlen)
+{
+    __builtin_cpu_init();
+    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c")) {
+        snprintf(err, errlen, "CPU 不支持 AVX2/FMA/F16C");
+        return NULL;
+    }
+    return cpu_alloc(w, threads);
 }

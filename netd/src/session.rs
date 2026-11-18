@@ -64,6 +64,7 @@ pub struct Session {
     ts_offset: AtomicI64,
     task: AtomicU64,
     closed: AtomicBool,
+    reader_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 /// 推送事件（cmd 8074 订阅后服务端主动发来的 notify 帧）。
@@ -128,6 +129,16 @@ fn parse_clip(m: &Msg) -> Clip {
     }
 }
 
+const MAX_SNAPPY_UNPACK: usize = 32 << 20;
+
+fn snap_decompress_capped(src: &[u8]) -> Res<Vec<u8>> {
+    let n = snap::raw::decompress_len(src)?;
+    if n > MAX_SNAPPY_UNPACK {
+        return Err(format!("snappy payload too large ({n} bytes)").into());
+    }
+    Ok(snap::raw::Decoder::new().decompress_vec(src)?)
+}
+
 impl Session {
     /// 建立 WebSocket 连接。返回会话和推送接收端；推送接收端关闭 = 连接断了。
     pub async fn connect(ident: Identity) -> Res<(Arc<Session>, mpsc::UnboundedReceiver<Vec<u8>>)> {
@@ -153,6 +164,7 @@ impl Session {
             ts_offset: AtomicI64::new(0),
             task: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            reader_abort: Mutex::new(None),
         });
 
         tokio::spawn(async move {
@@ -165,7 +177,7 @@ impl Session {
         });
 
         let weak = Arc::downgrade(&s);
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             while let Some(frame) = stream.next().await {
                 let data = match frame {
                     Ok(Message::Binary(d)) => d,
@@ -190,6 +202,7 @@ impl Session {
             }
             drop(push_tx);
         });
+        *s.reader_abort.lock().unwrap() = Some(reader_handle.abort_handle());
         Ok((s, push_rx))
     }
 
@@ -211,7 +224,16 @@ impl Session {
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.pending.lock().unwrap().clear();
         let _ = self.out.send(Message::Close(None));
+        if let Some(abort) = self.reader_abort.lock().unwrap().take() {
+            // 给对端留短暂时间回 Close，超时则强行中止读任务避免网络黑洞永久泄漏
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                abort.abort();
+            });
+        }
     }
 
     fn server_ms(&self) -> i64 {
@@ -292,7 +314,13 @@ impl Session {
         let frame = Pb::new().varint(1, 0).varint(2, 0).varint(3, task).varint(4, 0).msg(5, &inner);
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(task, tx);
+        {
+            let mut p = self.pending.lock().unwrap();
+            if self.is_closed() {
+                return Err("connection closed".into());
+            }
+            p.insert(task, tx);
+        }
         if self.out.send(Message::Binary(frame.into_vec())).is_err() {
             self.pending.lock().unwrap().remove(&task);
             return Err("connection closed".into());
@@ -324,8 +352,15 @@ impl Session {
         if status != 200 || body.is_empty() {
             return Err(format!("timestamp failed: {status}").into());
         }
-        let plain = crypto::aes_decrypt(&body, self.static_key).unwrap_or(body);
+        // /timestamp 实测返回明文 protobuf（长度非 16 倍数），兼容可能加密的回包并校验时间戳合理性
+        let plain = match crypto::aes_decrypt(&body, self.static_key) {
+            Ok(p) => p,
+            Err(_) => body,
+        };
         let server = Msg::parse(&plain)?.int(1) as i64;
+        if server < 1_500_000_000_000 {
+            return Err("invalid server timestamp".into());
+        }
         let off = server - local;
         self.ts_offset.store(off, Ordering::Relaxed);
         Ok(off)
@@ -431,12 +466,12 @@ impl Session {
         // 响应是先压缩后加密：先解密再解压
         let mut plain = crypto::aes_decrypt(&rbody, &aes)?;
         if hdrs.get("Kb-CompressionType").map(|s| s.as_str()) == Some("2") {
-            plain = snap::raw::Decoder::new().decompress_vec(&plain)?;
+            plain = snap_decompress_capped(&plain)?;
         }
         let rsp = Msg::parse(&plain)?;
         let inner = rsp.bytes(6).to_vec();
         if rsp.int(3) == COMPRESS_SNAPPY && !inner.is_empty() {
-            return Ok(snap::raw::Decoder::new().decompress_vec(&inner)?);
+            return snap_decompress_capped(&inner);
         }
         Ok(inner)
     }
@@ -465,7 +500,7 @@ impl Session {
         }
         let mut plain = crypto::aes_decrypt(&rbody, &aes)?;
         if hdrs.get("Kb-CompressionType").map(|s| s.as_str()) == Some("2") {
-            plain = snap::raw::Decoder::new().decompress_vec(&plain)?;
+            plain = snap_decompress_capped(&plain)?;
         }
         Ok(plain)
     }

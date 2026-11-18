@@ -78,6 +78,9 @@ impl Curve {
     }
     fn on_curve(&self, x: &BigUint, y: &BigUint) -> bool {
         let p = &self.p;
+        if x >= p || y >= p {
+            return false;
+        }
         let lhs = y * y % p;
         let rhs = (x * x % p * x + &self.a * x + &self.b) % p;
         lhs == rhs
@@ -122,17 +125,14 @@ impl EcdhKey {
         hex::encode_upper(raw)
     }
 
-    /// 16 字节共享密钥（X 坐标）。服务器公钥按官方写法解析：去掉前两个字符，剩下对半分。
+    /// 16 字节共享密钥（X 坐标）。校验 `04 || X || Y`（66 个十六进制字符）与曲线点合法性。
     pub fn shared_secret(&self, server_public: &str) -> Result<[u8; 16], String> {
         let c = curve();
-        if server_public.len() <= 2 || !server_public.is_ascii() {
-            return Err("server public key too short".into());
+        if server_public.len() != 66 || !server_public.starts_with("04") || !server_public.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid server public key format".into());
         }
         let body = &server_public[2..];
-        if body.len() % 2 != 0 {
-            return Err("server public key: odd length".into());
-        }
-        let (xs, ys) = body.split_at(body.len() / 2);
+        let (xs, ys) = body.split_at(32);
         let x = BigUint::parse_bytes(xs.as_bytes(), 16).ok_or("bad hex")?;
         let y = BigUint::parse_bytes(ys.as_bytes(), 16).ok_or("bad hex")?;
         if !c.on_curve(&x, &y) {
@@ -289,32 +289,45 @@ fn ime_net_candidates() -> Vec<std::path::PathBuf> {
 }
 
 fn load_keys() -> Option<Keys> {
-    let data = ime_net_candidates().into_iter().find_map(|p| std::fs::read(p).ok())?;
-    let mut keys = Keys { aes: Vec::new(), sign: Vec::new() };
-    // 以 0 结尾、只含字母和数字的字符串
-    let mut start = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b.is_ascii_alphanumeric() {
-            continue;
-        }
-        let run = &data[start..i];
-        start = i + 1;
-        if b != 0 || (run.len() != 16 && run.len() != 32) {
-            continue;
-        }
-        let h = hex::encode(Sha256::digest(run));
-        let leak = || -> &'static str { Box::leak(String::from_utf8_lossy(run).into_owned().into_boxed_str()) };
-        if let Some(&(p, _)) = AES_KEY_SHA256.iter().find(|(_, x)| *x == h) {
-            if !keys.aes.iter().any(|(q, _)| *q == p) {
-                keys.aes.push((p, leak().as_bytes()));
+    for path in ime_net_candidates() {
+        let Ok(data) = std::fs::read(path) else { continue };
+        let mut aes_raw: Vec<(u32, String)> = Vec::new();
+        let mut sign_raw: Vec<(u32, String)> = Vec::new();
+        // 以 0 结尾、只含字母和数字的字符串
+        let mut start = 0;
+        for (i, &b) in data.iter().enumerate() {
+            if b.is_ascii_alphanumeric() {
+                continue;
             }
-        } else if let Some(&(p, _)) = SIGN_KEY_SHA256.iter().find(|(_, x)| *x == h) {
-            if !keys.sign.iter().any(|(q, _)| *q == p) {
-                keys.sign.push((p, leak()));
+            let run = &data[start..i];
+            start = i + 1;
+            if b != 0 || (run.len() != 16 && run.len() != 32) {
+                continue;
             }
+            let h = hex::encode(Sha256::digest(run));
+            if let Some(&(p, _)) = AES_KEY_SHA256.iter().find(|(_, x)| *x == h) {
+                if !aes_raw.iter().any(|(q, _)| *q == p) {
+                    aes_raw.push((p, String::from_utf8_lossy(run).into_owned()));
+                }
+            } else if let Some(&(p, _)) = SIGN_KEY_SHA256.iter().find(|(_, x)| *x == h) {
+                if !sign_raw.iter().any(|(q, _)| *q == p) {
+                    sign_raw.push((p, String::from_utf8_lossy(run).into_owned()));
+                }
+            }
+        }
+        if aes_raw.len() == AES_KEY_SHA256.len() && sign_raw.len() == SIGN_KEY_SHA256.len() {
+            let aes = aes_raw
+                .into_iter()
+                .map(|(p, s)| (p, Box::leak(s.into_boxed_str()).as_bytes()))
+                .collect();
+            let sign = sign_raw
+                .into_iter()
+                .map(|(p, s)| (p, &*Box::leak(s.into_boxed_str())))
+                .collect();
+            return Some(Keys { aes, sign });
         }
     }
-    (keys.aes.len() == AES_KEY_SHA256.len() && keys.sign.len() == SIGN_KEY_SHA256.len()).then_some(keys)
+    None
 }
 
 fn keys() -> Option<&'static Keys> {

@@ -7,3 +7,4 @@ Requires=minime-asrd.socket
 ExecStart=/usr/bin/minime-asrd
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes

@@ -32,16 +32,29 @@ impl Default for Config {
 
 pub fn path() -> PathBuf {
     if let Ok(p) = std::env::var("MINIME_NETD_CONFIG") {
-        return PathBuf::from(p);
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
     }
     let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
     base.join("fcitx5/conf/minime.conf")
 }
 
+fn strip_comment(v: &str) -> &str {
+    // 只把空白之后的 # 当作行尾注释，避免误伤本身含 # 的设备名
+    match v.find('#') {
+        Some(0) => "",
+        Some(i) if v.as_bytes()[i - 1].is_ascii_whitespace() => &v[..i],
+        _ => v,
+    }
+}
+
 fn parse_bool(v: &str) -> Option<bool> {
-    match v.trim() {
+    match strip_comment(v).trim() {
         "True" | "true" | "1" | "yes" => Some(true),
         "False" | "false" | "0" | "no" => Some(false),
         _ => None,
@@ -71,7 +84,7 @@ pub fn parse(text: &str) -> Config {
             "CloudInput" => c.cloud = parse_bool(v).unwrap_or(c.cloud),
             "UserDictSync" => c.user_dict = parse_bool(v).unwrap_or(c.user_dict),
             "DeviceName" => {
-                let v = v.trim();
+                let v = strip_comment(v).trim();
                 if !v.is_empty() {
                     c.device_name = v.chars().take(32).collect();
                 }

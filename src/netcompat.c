@@ -178,10 +178,13 @@ static void *reader_main(void *arg)
         }
         uint32_t hdr[3];
         if (read_full(fd, hdr, sizeof(hdr)) < 0) {
-            /* 连接断了：所有等待中的任务都按失败回调 */
+        disconnected:
+            /* 连接断了：由读线程统一关 FD 并把所有等待中的任务按失败回调 */
             pthread_mutex_lock(&g_nc.mu);
-            close(g_nc.fd);
-            g_nc.fd = -1;
+            if (g_nc.fd >= 0) {
+                close(g_nc.fd);
+                g_nc.fd = -1;
+            }
             int n = g_nc.npend;
             typeof(g_nc.pend[0]) copy[MAXPEND];
             memcpy(copy, g_nc.pend, sizeof(copy[0]) * (size_t)n);
@@ -199,11 +202,13 @@ static void *reader_main(void *arg)
         }
         uint32_t len = hdr[0];
         int32_t task = (int32_t)hdr[1], err = (int32_t)hdr[2];
-        uint32_t blen = len >= 8 ? len - 8 : 0;
+        if (len < 8 || len - 8 > (16u << 20))
+            goto disconnected;
+        uint32_t blen = len - 8;
         uint8_t *body = blen ? malloc(blen) : NULL;
         if (blen && read_full(fd, body, blen) < 0) {
             free(body);
-            continue;
+            goto disconnected;
         }
         void *user;
         task_cb cb;
@@ -298,8 +303,8 @@ static WXIME_CALL int32_t nc_net_start_task_with_option(void *ctx, int32_t cmd, 
         void *u;
         task_cb c;
         take_pending(task, &u, &c, NULL);
-        close(g_nc.fd);
-        g_nc.fd = -1;
+        if (g_nc.fd >= 0)
+            shutdown(g_nc.fd, SHUT_RDWR);   /* 让 reader_main 统一关 FD 并失败其余等待中的任务 */
         pthread_mutex_unlock(&g_nc.mu);
         return -1;
     }
@@ -343,8 +348,8 @@ int32_t netcompat_cos(int upload, const char *url, int url_len, const char *path
         void *u;
         task_cb c;
         take_pending(task, &u, &c, NULL);
-        close(g_nc.fd);
-        g_nc.fd = -1;
+        if (g_nc.fd >= 0)
+            shutdown(g_nc.fd, SHUT_RDWR);   /* 让 reader_main 统一关 FD 并失败其余等待中的任务 */
         pthread_mutex_unlock(&g_nc.mu);
         return -1;
     }

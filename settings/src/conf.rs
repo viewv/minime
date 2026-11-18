@@ -7,11 +7,15 @@ use std::path::PathBuf;
 
 pub fn path() -> PathBuf {
     if let Ok(p) = std::env::var("MINIME_NETD_CONFIG") {
-        return PathBuf::from(p);
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
     }
     let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
     base.join("fcitx5/conf/minime.conf")
 }
 
@@ -100,6 +104,28 @@ impl Ini {
         self.set(section, key, if v { "True" } else { "False" });
     }
 
+    pub fn has_section(&self, section: &str) -> bool {
+        self.range(section).is_some()
+    }
+
+    /// 清空段内所有键值（保留 `[section]` 节头，供 fcitx5 KeyList 表达“不使用/空列表”）
+    pub fn clear_section(&mut self, section: &str) {
+        if let Some((s, e)) = self.range(section) {
+            let mut i = e;
+            while i > s {
+                i -= 1;
+                if key_of(&self.lines[i]).is_some() {
+                    self.lines.remove(i);
+                }
+            }
+        } else {
+            if self.lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                self.lines.push(String::new());
+            }
+            self.lines.push(format!("[{section}]"));
+        }
+    }
+
     pub fn to_text(&self) -> String {
         let mut s = self.lines.join("\n");
         s.push('\n');
@@ -115,7 +141,7 @@ impl Ini {
         let tmp = p.with_extension("conf.tmp");
         std::fs::write(&tmp, self.to_text())?;
         std::fs::rename(&tmp, &p)?;
-        let _ = std::process::Command::new("busctl")
+        if let Ok(mut child) = std::process::Command::new("busctl")
             .args([
                 "--user",
                 "call",
@@ -128,7 +154,12 @@ impl Ini {
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         Ok(())
     }
 }

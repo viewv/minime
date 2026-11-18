@@ -1,6 +1,6 @@
 /* engined.c — 原生常驻服务：在 Linux 进程里装载微信输入法引擎，对前端提供会话。
  *
- * 对前端说的是现有插件已经会的协议（wetype.commands 的子集，见 开发笔记（未公开）），
+ * 对前端说的是现有插件已经会的协议（wetype.commands 的子集，见 docs/architecture.md），
  * 帧格式和 Wine 栈的 bridge 一样：uint32 LE 长度 + 负载，连接建立后服务先发 "PID:<n>"。
  * fcitx5 插件优先连 Unix socket，连不上再连 Wine 栈的 TCP 17890。
  *
@@ -548,6 +548,7 @@ typedef struct Conn {
     int ncands, capcands;
     void *iter;                /* 引擎最近一次的候选迭代器（留着给"要更多候选"用），wmu 保护 */
     int more;                  /* 迭代器里可能还有候选 */                /* 引擎最近一次给的候选（发给前端前要和 e2e 结果合并） */
+    Buf last_pending;          /* 最近一次下发的预编辑内容（Field 3），snd 保护；被拒选词时原样重发 */
     char letters[256];         /* 当前组合里输入的字母（给 e2e 用） */
     int nletters;
     int e2e_ok;                /* 0：这次组合里选过引擎的部分候选，剩下的拼音不再跑 e2e */
@@ -692,6 +693,19 @@ static void clear_cands(Conn *c)
     c->ncands = 0;
 }
 
+static void drop_session_cands(Conn *c)
+{
+    pthread_mutex_lock(&c->wmu);
+    if (c->iter)
+        wx.delete_candidate_iterator(c->iter);
+    c->iter = NULL;
+    c->more = 0;
+    clear_cands(c);
+    b_free(&c->ids);
+    c->e2e_text[0] = 0;
+    pthread_mutex_unlock(&c->wmu);
+}
+
 static int is_ascii_text(const char *s)
 {
     return s && s[0] && (unsigned char)s[0] < 0x80;
@@ -755,6 +769,10 @@ static WXIME_CALL void on_learn_events(uint64_t sid, const int32_t *types, void 
             g_learn.ncand_ev++;
             pthread_mutex_unlock(&g_learn.mu);
             any = 1;
+        } else if (types[i] == WXIME_EVT_CLOUD_ITERATOR_UPDATE && datas[i]) {
+            WximeCandidateListEvent *ev = datas[i];
+            if (ev->new_iterator)
+                wx.delete_candidate_iterator((void *)ev->new_iterator);
         } else if (types[i] == WXIME_EVT_EMIT && datas[i]) {
             pthread_mutex_lock(&g_learn.mu);
             g_learn.nemit_ev++;
@@ -1001,8 +1019,9 @@ static void send_candidates(Conn *c)
         if (use_e2e && !strcmp(c->e2e_text, hw))
             use_e2e = 0;
     }
+    int e2e_emitted = 0;
     for (int i = 0; i <= c->ncands; i++) {
-        if (use_e2e && out == pos) {
+        if (use_e2e && !e2e_emitted && (out == pos || i == c->ncands)) {
             Buf w = {0};
             uint32_t idn = (uint32_t)sizeof(E2E_ID) - 1;
             b_bytes(&w, 1, c->e2e_text, strlen(c->e2e_text));
@@ -1013,6 +1032,7 @@ static void send_candidates(Conn *c)
             b_bytes(&list, 1, w.p, w.n);
             b_free(&w);
             out++;
+            e2e_emitted = 1;
         }
         if (i == c->ncands)
             break;
@@ -1180,6 +1200,7 @@ static int cc_init(void)
         return g_cc.ok;
     g_cc.tried = 1;
     void *lib = dlopen("libopencc.so.1.4", RTLD_NOW);
+    if (!lib) lib = dlopen("libopencc.so.1.1", RTLD_NOW);
     if (!lib) lib = dlopen("libopencc.so", RTLD_NOW);
     if (!lib) {
         fprintf(stderr, "[engined] 没有 libopencc，繁体模式下不出 e2e 整句候选\n");
@@ -1244,7 +1265,7 @@ static void *e2e_main(void *arg)
             continue;
         /* 放第几位：整句概率够高（短输入、靠上下文分辨的词），或者模型认为它比引擎首选好得多
          * （长句：引擎首选的分数更高说明 e2e 的 beam 漏掉了它，这时 e2e 结果多半是错的） */
-        int jp = e2e_is_jianpin(g_e2e, letters);
+        int jp = e2e_is_jianpin_fuzzy(g_e2e, letters);
         char top0[256] = "";
         int top_fixed = 0;
         pthread_mutex_lock(&c->wmu);
@@ -1358,12 +1379,28 @@ static void on_pending(Conn *c, WximePendingNode *head)
     }
     if (head)
         wx.free_pending_input(head);
+    pthread_mutex_lock(&c->wmu);
+    c->last_pending.n = 0;
+    if (plist.n)
+        b_put(&c->last_pending, plist.p, plist.n);
+    pthread_mutex_unlock(&c->wmu);
     Buf d = {0};
     b_uint(&d, 1, RESP_PENDING);
     b_bytes(&d, 3, plist.p, plist.n);
     send_detail(c, &d);
     b_free(&d);
     b_free(&plist);
+}
+
+static void resend_pending(Conn *c)
+{
+    Buf d = {0};
+    b_uint(&d, 1, RESP_PENDING);
+    pthread_mutex_lock(&c->wmu);
+    b_bytes(&d, 3, c->last_pending.p, c->last_pending.n);
+    pthread_mutex_unlock(&c->wmu);
+    send_detail(c, &d);
+    b_free(&d);
 }
 
 static void on_emit(Conn *c, WximeEmitEvent *ev)
@@ -1489,6 +1526,7 @@ static void handle_detail(Conn *c, Rd d)
         if (c->priv != cfg_priv && g_debug)
             fprintf(stderr, "[engined] #%d %s隐私输入框\n", c->id, cfg_priv ? "进入" : "离开");
         if (c->priv != cfg_priv && c->sid) {     /* 引擎学不学选词是会话配置，只能重建；这时还没有组合 */
+            drop_session_cands(c);
             wx.destroy_session(c->sid);
             c->sid = 0;
             comp_reset(c);
@@ -1539,11 +1577,22 @@ static void handle_detail(Conn *c, Rd d)
         wx_opts.scheme = cfg_scheme;
         wx_opts.shuangpin = cfg_sp;
         wx_opts.wubi = cfg_wubi;
+        if (g_cloud_active)
+            netcompat_set_enabled(!c->priv && wx_opts.scheme == 0);
         if (c->sid) {                           /* 会话选项只在建会话时生效：重建 */
+            pthread_mutex_lock(&c->wmu);
+            int had_comp = c->nletters > 0 || c->ncands > 0 || c->last_pending.n > 0;
+            pthread_mutex_unlock(&c->wmu);
+            drop_session_cands(c);
             wx.destroy_session(c->sid);
             c->sid = 0;
             comp_reset(c);
+            e2e_post(c);
             ensure_session(c);
+            if (had_comp) {                     /* 前端同步清掉旧预编辑/候选，避免和已销毁的旧会话状态分裂 */
+                on_pending(c, NULL);
+                send_candidates(c);
+            }
         }
         if (g_learn.sid) {
             g_learn_stale = 1;
@@ -1590,8 +1639,10 @@ static void handle_detail(Conn *c, Rd d)
     }
     case CMD_DESTROY_SESSION:
         if (c->sid) {
+            drop_session_cands(c);
             wx.destroy_session(c->sid);
             c->sid = 0;
+            comp_reset(c);
         }
         break;
     case CMD_SEND_KEY: {
@@ -1601,8 +1652,10 @@ static void handle_detail(Conn *c, Rd d)
             else if (f == 2 && w == 0) special = (uint32_t)v;
         }
         ensure_session(c);
-        if (!c->sid)
+        if (!c->sid) {
+            on_pending(c, NULL);                /* 让前端 inflight_ 正常归零 */
             break;
+        }
         if (g_debug)
             fprintf(stderr, "[engined] #%d key code=%u special=%u\n", c->id, code, special);
         if (special == KEY_TEXT_INPUT && code) {
@@ -1611,7 +1664,8 @@ static void handle_detail(Conn *c, Rd d)
             encode_utf8(code, u, &n);
             pthread_mutex_lock(&c->wmu);
             uint32_t lc = code >= 'A' && code <= 'Z' ? code + 32 : code;
-            if (lc >= 'a' && lc <= 'z' && c->nletters < (int)sizeof(c->letters) - 1)
+            if (((lc >= 'a' && lc <= 'z') || lc == '\'' || lc == ';') &&
+                c->nletters < (int)sizeof(c->letters) - 1)
                 c->letters[c->nletters++] = (char)lc;
             if (code >= 'A' && code <= 'Z')
                 c->e2e_ok = 0;          /* 打了大写字母（iPhone、PDF）：是英文，整句模型只认拼音，这次组合不跑 */
@@ -1631,8 +1685,7 @@ static void handle_detail(Conn *c, Rd d)
         } else if (special == KEY_ESCAPE) {
             comp_reset(c);
             e2e_post(c);                        /* 取消正在跑的 e2e */
-            wx.reset_session(c->sid);
-            on_pending(c, NULL);                /* 引擎不发空预编辑，替它发 */
+            wx.reset_session(c->sid);           /* 会经 on_events 发送空 RESP_PENDING 与空候选，勿重复手发 */
         }
         break;
     }
@@ -1654,8 +1707,7 @@ static void handle_detail(Conn *c, Rd d)
             b_free(&d);
             comp_reset(c);
             e2e_post(c);
-            wx.reset_session(c->sid);
-            on_pending(c, NULL);
+            wx.reset_session(c->sid);           /* 同步触发空 RESP_PENDING 与空候选 */
             break;
         }
         if (c->sid && text.p && idn == sizeof(E2E_ID) - 1 && !memcmp(id.p, E2E_ID, idn) &&
@@ -1678,12 +1730,13 @@ static void handle_detail(Conn *c, Rd d)
                 learn_e2e(letters, sel);
             comp_reset(c);
             e2e_post(c);
-            wx.reset_session(c->sid);
-            on_pending(c, NULL);
+            wx.reset_session(c->sid);           /* 同步触发空 RESP_PENDING 与空候选 */
             break;
         }
         if (!c->sid || !text.p || !id.p || !conn_has_id(c, id.p, (uint32_t)(id.end - id.p))) {
             fprintf(stderr, "[engined] #%d 拒绝选词：id 不在最近的候选里\n", c->id);
+            resend_pending(c);
+            send_candidates(c);                 /* 退还一帧预编辑+当前候选，防前端 inflight_ 永久卡死 */
             break;
         }
         if (g_debug)
@@ -1761,6 +1814,11 @@ static void conn_close(Conn *c)
         wx.delete_candidate_iterator(c->iter);
     c->iter = NULL;
     c->more = 0;
+    clear_cands(c);
+    free(c->cands);
+    c->cands = NULL;
+    b_free(&c->ids);
+    b_free(&c->last_pending);
     pthread_mutex_unlock(&c->wmu);
     if (c->sid)
         wx.destroy_session(c->sid);

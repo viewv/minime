@@ -3,11 +3,15 @@
 *Yet another Linux port of the WeType engine* —— 在 Linux 上原生运行微信输入法引擎的 fcitx5 输入法。
 
 > [!WARNING]
-> **测试版（0.1.4）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
+> **测试版（0.2.0）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
 > 不建议作为唯一的输入法使用。
 >
-> **Beta (0.1.4)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
+> **Beta (0.2.0)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
 > your only input method. 
+
+<p align="center">
+  <img src="docs/images/demo.webp" width="760" alt="用 MinIME 打出「落霞与孤鹜齐飞，秋水共长天一色」">
+</p>
 
 微信输入法官方只提供 Windows、macOS 和移动端版本。在 Linux 上使用它，常见的做法是用 Wine 运行 Windows 版、
 在虚拟机里运行，或者通过 ARM 转译运行安卓版。MinIME 采用另一条路线：**尽可能把每个组件都做成 Linux 原生程序**。
@@ -47,6 +51,19 @@
 **设置程序**
 
 - 「MinIME 设置」提供输入方案、候选、语音、词库、模型、跨设备等全部选项，以及各个后台服务的状态和重启按钮。
+
+<table>
+  <tr>
+    <td><img src="docs/images/settings-input.webp" alt="设置程序：输入"></td>
+    <td><img src="docs/images/settings-cross-device.webp" alt="设置程序：跨设备"></td>
+    <td><img src="docs/images/settings-dicts.webp" alt="设置程序：词库"></td>
+  </tr>
+  <tr>
+    <td align="center">输入方案、整句候选、标点和自动空格</td>
+    <td align="center">关联手机、换机助手、同步和云输入</td>
+    <td align="center">内置词库、专题词库和其他平台的词库</td>
+  </tr>
+</table>
 
 候选框外观沿用 fcitx5 的主题设置，本项目不附带主题。
 

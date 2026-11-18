@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,8 +36,8 @@ const MODEL_URL: &str =
 const MODEL_MD5: &str = "28386481eb94ff73b28ee3949c0cf690";
 const MODEL_SIZE: u64 = 102_920_639;
 
-/// 一次说话最长这么久，到点自动结束
-const MAX_UTTERANCE: Duration = Duration::from_secs(120);
+/// 一次说话最长这么久，到点自动结束（流式分块解码，可支持长段输入）
+const MAX_UTTERANCE: Duration = Duration::from_secs(300);
 /// 中间结果的刷新间隔
 const PARTIAL_EVERY: Duration = Duration::from_millis(300);
 /// 每次从录音进程读 100 ms（16 kHz × 2 字节）
@@ -74,9 +74,10 @@ fn socket_path() -> PathBuf {
 }
 
 fn model_installed(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".xnet")))
-        .unwrap_or(false)
+    dir.join("dict.decoder.utf8.txt").is_file()
+        && std::fs::read_dir(dir)
+            .map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".xnet")))
+            .unwrap_or(false)
 }
 
 // ------------------------------------------------------------------ 模型下载
@@ -90,6 +91,9 @@ fn fetch_model() -> Result<(), String> {
     let parent = dir.parent().ok_or("bad model dir")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let apk = parent.join("ime_asr_decoder_model.apk");
+    if std::fs::metadata(&apk).map(|m| m.len() > MODEL_SIZE).unwrap_or(false) {
+        let _ = std::fs::remove_file(&apk);
+    }
     let ok_size = std::fs::metadata(&apk).map(|m| m.len() == MODEL_SIZE).unwrap_or(false);
     // minime-fetch --json 调用时：报总大小和阶段，curl 不打进度条（minime-fetch 按文件长度算进度）
     let json = std::env::var_os("MINIME_FETCH_JSON").is_some();
@@ -106,6 +110,9 @@ fn fetch_model() -> Result<(), String> {
             .status()
             .map_err(|e| format!("运行 curl 失败：{e}"))?;
         if !st.success() {
+            if matches!(st.code(), Some(22 | 33)) || std::fs::metadata(&apk).map(|m| m.len() >= MODEL_SIZE).unwrap_or(false) {
+                let _ = std::fs::remove_file(&apk);
+            }
             return Err("下载失败".into());
         }
     }
@@ -164,23 +171,43 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
-fn session(conn: UnixStream, cancel: Arc<AtomicBool>) {
+type SharedModel = Arc<Mutex<Option<Arc<wechat_asr_gpu::Model>>>>;
+
+struct SessionCtl {
+    cancel: AtomicBool,
+    rec_pid: AtomicU32,
+}
+
+fn kill_pid(pid: u32, sig: i32) {
+    if pid == 0 {
+        return;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe {
+        kill(pid as i32, sig);
+    }
+}
+
+fn session(conn: UnixStream, ctl: Arc<SessionCtl>, shared_model: SharedModel) {
     let closer = conn.try_clone().ok();
-    run_session(conn, cancel);
+    run_session(conn, &ctl, shared_model);
     // 收命令的线程还拿着这条连接：显式关掉，客户端才读到结束
     if let Some(c) = closer {
         let _ = c.shutdown(std::net::Shutdown::Both);
     }
 }
 
-fn run_session(conn: UnixStream, cancel: Arc<AtomicBool>) {
+fn run_session(conn: UnixStream, ctl: &Arc<SessionCtl>, shared_model: SharedModel) {
+    let cancel = &ctl.cancel;
     let mut out = match conn.try_clone() {
         Ok(c) => c,
         Err(_) => return,
     };
     let mut rd = BufReader::new(conn);
     let mut line = String::new();
-    if rd.read_line(&mut line).unwrap_or(0) == 0 || line.trim() != "start" {
+    if (&mut rd).take((64 << 10) + 1).read_line(&mut line).unwrap_or(0) == 0 || line.len() > (64 << 10) || line.trim() != "start" {
         let _ = writeln!(out, "error 用法：start / stop / cancel");
         return;
     }
@@ -191,11 +218,21 @@ fn run_session(conn: UnixStream, cancel: Arc<AtomicBool>) {
         send(&mut out, "error 语音模型未安装（运行 minime-asrd fetch-model）".into());
         return;
     }
-    let model = match wechat_asr_gpu::load(&dir) {
-        Ok(m) => m,
-        Err(e) => {
-            send(&mut out, one_line(&format!("error 模型加载失败：{e}")));
-            return;
+    let model = {
+        let mut g = shared_model.lock().unwrap();
+        if let Some(m) = g.as_ref() {
+            Arc::clone(m)
+        } else {
+            match wechat_asr_gpu::load(&dir) {
+                Ok(m) => {
+                    *g = Some(Arc::clone(&m));
+                    m
+                }
+                Err(e) => {
+                    send(&mut out, one_line(&format!("error 模型加载失败：{e}")));
+                    return;
+                }
+            }
         }
     };
     let mut rec = match spawn_recorder() {
@@ -205,30 +242,51 @@ fn run_session(conn: UnixStream, cancel: Arc<AtomicBool>) {
             return;
         }
     };
+    let rec_pid = rec.id();
+    ctl.rec_pid.store(rec_pid, Ordering::SeqCst);
+    if cancel.load(Ordering::SeqCst) {
+        ctl.rec_pid.store(0, Ordering::SeqCst);
+        let _ = rec.kill();
+        let _ = rec.wait();
+        return;
+    }
     let mut audio = rec.stdout.take().expect("piped");
     if !send(&mut out, "ready".into()) {
+        ctl.rec_pid.store(0, Ordering::SeqCst);
         let _ = rec.kill();
         let _ = rec.wait();
         return;
     }
 
-    // 客户端的 stop / cancel / 断开在单独的线程里收
+    // 客户端的 stop / cancel / 断开在单独的线程里收；同时发信号打断阻塞在 audio.read 的录音进程
     let stop = Arc::new(AtomicBool::new(false));
     {
-        let (stop, cancel) = (stop.clone(), cancel.clone());
+        let (stop, ctl) = (stop.clone(), ctl.clone());
         std::thread::spawn(move || {
             let mut l = String::new();
             loop {
                 l.clear();
-                match rd.read_line(&mut l) {
+                let n = (&mut rd).take((64 << 10) + 1).read_line(&mut l);
+                if l.len() > (64 << 10) {
+                    ctl.cancel.store(true, Ordering::SeqCst);
+                    kill_pid(ctl.rec_pid.load(Ordering::SeqCst), 9);
+                    break;
+                }
+                match n {
                     Ok(0) | Err(_) => {
-                        cancel.store(true, Ordering::SeqCst);
+                        ctl.cancel.store(true, Ordering::SeqCst);
+                        kill_pid(ctl.rec_pid.load(Ordering::SeqCst), 9);
                         break;
                     }
                     Ok(_) => match l.trim() {
-                        "stop" => stop.store(true, Ordering::SeqCst),
+                        "stop" => {
+                            stop.store(true, Ordering::SeqCst);
+                            kill_pid(ctl.rec_pid.load(Ordering::SeqCst), 15);
+                            break;
+                        }
                         "cancel" => {
-                            cancel.store(true, Ordering::SeqCst);
+                            ctl.cancel.store(true, Ordering::SeqCst);
+                            kill_pid(ctl.rec_pid.load(Ordering::SeqCst), 9);
                             break;
                         }
                         _ => {}
@@ -284,6 +342,7 @@ fn run_session(conn: UnixStream, cancel: Arc<AtomicBool>) {
             }
         }
     };
+    ctl.rec_pid.store(0, Ordering::SeqCst);
     let _ = rec.kill();
     let _ = rec.wait();
     if !finished {
@@ -369,11 +428,15 @@ fn daemon() -> i32 {
             }
         });
     }
+    let shared_model: SharedModel = Arc::new(Mutex::new(None));
     let dir = model_dir();
     if model_installed(&dir) {
-        // 启动时先加载一次（mmap，约 0.1 s），第一次说话不用等
+        // 启动时加载并保留在内存里（mmap，约 0.1 s），空闲 10 分钟随进程退出释放
         match wechat_asr_gpu::load(&dir) {
-            Ok(_) => log!("model ready ({})", dir.display()),
+            Ok(m) => {
+                *shared_model.lock().unwrap() = Some(m);
+                log!("model ready ({})", dir.display());
+            }
             Err(e) => log!("model load failed: {e}"),
         }
     } else {
@@ -381,8 +444,8 @@ fn daemon() -> i32 {
     }
     log!("listening on {}{}", path.display(), if on_demand { "（按需启动，空闲 10 分钟退出）" } else { "" });
 
-    // 同一时间只有一次说话：新连接取消旧的
-    let current: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    // 同一时间只有一次说话：新连接取消并立即终止旧会话的录音进程
+    let current: Arc<Mutex<Option<Arc<SessionCtl>>>> = Arc::new(Mutex::new(None));
     let serial = AtomicU64::new(0);
     for conn in listener.incoming().flatten() {
         // 只接受同一用户
@@ -394,15 +457,17 @@ fn daemon() -> i32 {
         if !uid_ok {
             continue;
         }
-        let cancel = Arc::new(AtomicBool::new(false));
-        if let Some(old) = current.lock().unwrap().replace(cancel.clone()) {
-            old.store(true, Ordering::SeqCst);
+        let ctl = Arc::new(SessionCtl { cancel: AtomicBool::new(false), rec_pid: AtomicU32::new(0) });
+        if let Some(old) = current.lock().unwrap().replace(ctl.clone()) {
+            old.cancel.store(true, Ordering::SeqCst);
+            kill_pid(old.rec_pid.load(Ordering::SeqCst), 9);
         }
         serial.fetch_add(1, Ordering::Relaxed);
         ACTIVE.fetch_add(1, Ordering::SeqCst);
         touch();
+        let shared_model = shared_model.clone();
         std::thread::spawn(move || {
-            session(conn, cancel);
+            session(conn, ctl, shared_model);
             touch();
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
         });
@@ -429,6 +494,41 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
     (r == 0).then_some(c.uid)
 }
 
+fn parse_wav_pcm(data: &[u8]) -> Result<&[u8], &'static str> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("不是有效的 RIFF/WAVE 文件");
+    }
+    let mut off = 12usize;
+    let mut fmt_ok = false;
+    let mut pcm_bytes = None;
+    while off + 8 <= data.len() {
+        let id = &data[off..off + 4];
+        let sz = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+        off += 8;
+        let end = off.saturating_add(sz).min(data.len());
+        if id == b"fmt " {
+            if end - off < 16 {
+                return Err("WAV fmt 块不完整");
+            }
+            let fmt = u16::from_le_bytes([data[off], data[off + 1]]);
+            let ch = u16::from_le_bytes([data[off + 2], data[off + 3]]);
+            let rate = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            let bits = u16::from_le_bytes([data[off + 14], data[off + 15]]);
+            if fmt != 1 || ch != 1 || rate != 16000 || bits != 16 {
+                return Err("只支持 16 kHz 单声道 16 位 PCM WAV");
+            }
+            fmt_ok = true;
+        } else if id == b"data" {
+            pcm_bytes = Some(&data[off..end]);
+        }
+        off = end + (sz & 1);
+    }
+    if !fmt_ok {
+        return Err("缺少 WAV fmt 块");
+    }
+    pcm_bytes.ok_or("缺少 WAV data 块")
+}
+
 /// 调试：识别一个 16 kHz 单声道 16 位 WAV（不经过麦克风）
 fn file(path: &str) -> i32 {
     let data = match std::fs::read(path) {
@@ -438,9 +538,14 @@ fn file(path: &str) -> i32 {
             return 1;
         }
     };
-    // 跳过 RIFF 头：找 "data" 块
-    let pos = data.windows(4).position(|w| w == b"data").map(|p| p + 8).unwrap_or(44);
-    let pcm: Vec<i16> = data[pos.min(data.len())..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let raw = match parse_wav_pcm(&data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return 1;
+        }
+    };
+    let pcm: Vec<i16> = raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
     let m = match wechat_asr_gpu::load(&model_dir()) {
         Ok(m) => m,
         Err(e) => {
@@ -512,4 +617,38 @@ fn main() {
         }
     };
     std::process::exit(rc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wav_pcm;
+
+    fn make_wav(ch: u16, rate: u32, bits: u16, pcm: &[u8], extra: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF\0\0\0\0WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&ch.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * u32::from(ch) * u32::from(bits) / 8).to_le_bytes());
+        v.extend_from_slice(&(ch * bits / 8).to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        v.extend_from_slice(pcm);
+        if pcm.len() & 1 == 1 {
+            v.push(0);
+        }
+        v.extend_from_slice(extra);
+        v
+    }
+
+    #[test]
+    fn wav_parser_checks_fmt_and_data_len() {
+        let w = make_wav(1, 16000, 16, &[1, 2, 3, 4], b"LIST\x04\0\0\0abcd");
+        assert_eq!(parse_wav_pcm(&w).unwrap(), &[1, 2, 3, 4]);
+        let bad = make_wav(2, 16000, 16, &[1, 2, 3, 4], b"");
+        assert!(parse_wav_pcm(&bad).is_err());
+    }
 }

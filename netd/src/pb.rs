@@ -139,7 +139,7 @@ impl Msg {
         String::from_utf8_lossy(self.bytes(field)).into_owned()
     }
 
-    /// 嵌套消息（字段缺失时返回空消息）。
+    /// 嵌套消息（字段缺失时返回空消息，保持 protobuf 语义）。
     pub fn sub(&self, field: u32) -> Result<Msg, PbError> {
         Msg::parse(self.bytes(field))
     }

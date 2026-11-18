@@ -34,7 +34,33 @@ static double now_ms(void)
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
-static float h2f(uint16_t h) { return _cvtsh_ss(h); }
+/* 便携式 IEEE-754 half→float（不依赖 F16C 指令，加载模型前即可安全执行） */
+static float h2f(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t frac = h & 0x3ffu;
+    uint32_t u;
+    if (exp == 0) {
+        if (frac == 0) {
+            u = sign;
+        } else {
+            uint32_t e = 113;
+            while (!(frac & 0x400u)) {
+                frac <<= 1;
+                e--;
+            }
+            u = sign | (e << 23) | ((frac & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        u = sign | 0x7f800000u | (frac ? 0x00400000u | (frac << 13) : 0u);
+    } else {
+        u = sign | ((exp + 112u) << 23) | (frac << 13);
+    }
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
 
 static const uint8_t *map_file(const char *path, size_t *size)
 {
@@ -169,7 +195,11 @@ static uint64_t city64_seed(const uint8_t *s, size_t n, uint64_t seed)
 /* mpd_e2e.bin 查单字读音，结果写进 out（每个读音一个 NUL 结尾串），返回个数 */
 static int mpd_lookup(const uint8_t *d, size_t size, const char *word, char out[][8], int maxo)
 {
+    if (size < 12)
+        return 0;
     uint32_t nb = rd32(d + 4);
+    if (!nb || 8 + 4 * (size_t)nb > size)
+        return 0;
     size_t wl = strlen(word);
     uint32_t bi = city32((const uint8_t *)word, wl) % nb;
     uint32_t ch = (uint32_t)city64_seed((const uint8_t *)word, wl, 0x1dbba5);
@@ -178,6 +208,8 @@ static int mpd_lookup(const uint8_t *d, size_t size, const char *word, char out[
         return 0;
     const uint8_t *blob = d + a;
     uint32_t n = rd32(blob);
+    if ((uint64_t)n > (b - a - 4) / 8)
+        return 0;
     for (uint32_t i = 0; i < n; i++) {
         if (rd32(blob + 4 + 4 * i) != ch)
             continue;
@@ -306,8 +338,14 @@ static int vocab_load(Vocab *v, const uint8_t *d, size_t size)
             if (!idp || !cp)
                 break;
             int id = atoi(idp + 5);
-            const char *q = strchr(cp + 10, '"'), *e;
-            vocab_put(v, id, json_str(q, stop, &e));
+            const char *q = memchr(cp + 10, '"', (size_t)(stop - (cp + 10))), *e;
+            if (!q)
+                break;
+            char *s = json_str(q, stop, &e);
+            if (id < 0 || id >= V || v->str[id])
+                free(s);
+            else
+                vocab_put(v, id, s);
             p = e;
         }
     }
@@ -323,8 +361,12 @@ static int vocab_load(Vocab *v, const uint8_t *d, size_t size)
         p = e;
         while (p < lim && *p != ':')
             p++;
+        if (p >= lim) {
+            free(s);
+            break;
+        }
         int id = atoi(p + 1);
-        if (v->str[id] || id < 0 || id >= V)
+        if (id < 0 || id >= V || v->str[id])
             free(s);
         else
             vocab_put(v, id, s), count++;
@@ -654,6 +696,8 @@ static int step(E2EModel *m, Node **nd, int B)
         tok[b] = nd[b]->tok;
         pos[b] = m->plen + nd[b]->depth;
         slot[b] = nd[b]->slot;
+        if (tok[b] < 0 || tok[b] >= V || pos[b] < 0 || pos[b] >= PMAX)
+            return -1;
         off[b] = (int)o;
         for (int i = 0; i < m->plen; i++)
             ctx[o++] = i;
@@ -721,7 +765,7 @@ static int cmp_hyp(const void *a, const void *b)
 }
 
 /* 8 路 float exp（Cephes expf 的多项式，相对误差约 2e-7）；x 要 <= 0（这里是 logit - max） */
-static inline __m256 exp8(__m256 x)
+static __attribute__((target("avx2,fma"))) inline __m256 exp8(__m256 x)
 {
     x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
     __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -738,7 +782,7 @@ static inline __m256 exp8(__m256 x)
     return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
 }
 
-static float logsumexp(const float *lg)      /* V 是 8 的倍数 */
+static __attribute__((target("avx2,fma"))) float logsumexp_avx2(const float *lg)      /* V 是 8 的倍数 */
 {
     __m256 m8 = _mm256_loadu_ps(lg);
     for (int i = 8; i < V; i += 8)
@@ -756,6 +800,30 @@ static float logsumexp(const float *lg)      /* V 是 8 的倍数 */
     for (int i = 0; i < 8; i++)
         s += t[i];
     return mx + (float)log(s);
+}
+
+static float logsumexp_scalar(const float *lg)
+{
+    float mx = lg[0];
+    for (int i = 1; i < V; i++)
+        if (lg[i] > mx) mx = lg[i];
+    double s = 0;
+    for (int i = 0; i < V; i++)
+        s += expf(lg[i] - mx);
+    return mx + (float)log(s);
+}
+
+static int g_has_avx2_fma = -1;
+
+static float logsumexp(const float *lg)
+{
+    int has = __atomic_load_n(&g_has_avx2_fma, __ATOMIC_RELAXED);
+    if (has < 0) {
+        __builtin_cpu_init();
+        has = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        __atomic_store_n(&g_has_avx2_fma, has, __ATOMIC_RELAXED);
+    }
+    return has ? logsumexp_avx2(lg) : logsumexp_scalar(lg);
 }
 
 static void decode_text(const E2EModel *m, const Node *n, char *out, size_t cap)
@@ -778,17 +846,37 @@ static void decode_text(const E2EModel *m, const Node *n, char *out, size_t cap)
     out[o] = 0;
 }
 
-/* 取出字母（转小写，只留 a-z）写进 inp，拼好提示 [CLS] 上下文 [SEP] 逐个字母 [SEP] [CLS] 并预填。
- * 返回字母数；0 = 没有字母，-1 = 前向失败 */
-static int setup_prompt(E2EModel *m, const char *context, const char *letters, char *inp)
+/* 提取字母（转小写，只留 a-z）写进 inp；若传入 sep（至少 257 字节），同时在 sep[pos] 标记用户输入的 ' 分隔位置 */
+static int extract_inp(const char *letters, char *inp, char *sep)
 {
     int L = 0;
+    if (sep)
+        memset(sep, 0, 257);
     for (const char *p = letters; *p && L < 255; p++) {          /* inp 至少 256 字节 */
         char c = *p;
         if (c >= 'A' && c <= 'Z') c += 32;
         if (c >= 'a' && c <= 'z') inp[L++] = c;
+        else if (c == '\'' && sep && L > 0) sep[L] = 1;
     }
     inp[L] = 0;
+    return L;
+}
+
+static int crosses_sep(const char *sep, int pos, int len)
+{
+    if (!sep)
+        return 0;
+    for (int i = pos + 1; i < pos + len; i++)
+        if (sep[i])
+            return 1;
+    return 0;
+}
+
+/* 取出字母（转小写，只留 a-z）写进 inp，拼好提示 [CLS] 上下文 [SEP] 逐个字母 [SEP] [CLS] 并预填。
+ * 返回字母数；0 = 没有字母，-1 = 前向失败 */
+static int setup_prompt(E2EModel *m, const char *context, const char *letters, char *inp, char *sep)
+{
+    int L = extract_inp(letters, inp, sep);
     if (!L)
         return 0;
 
@@ -797,10 +885,17 @@ static int setup_prompt(E2EModel *m, const char *context, const char *letters, c
     prompt[n++] = TOK_CLS;
     n += encode(&m->vocab, context ? context : "", prompt + n, PMAX / 2);
     prompt[n++] = TOK_SEP;
-    for (int i = 0; i < L && n < PMAX - 64; i++) {
+    int i = 0;
+    for (; i < L && n < PMAX - 64; i++) {
         char c[2] = { inp[i], 0 };
         int id = vocab_get(&m->vocab, c, 1);
         prompt[n++] = id >= 0 ? id : TOK_UNK;
+    }
+    if (i < L) {
+        L = i;
+        inp[L] = 0;
+        if (!L)
+            return 0;
     }
     prompt[n++] = TOK_SEP;
     prompt[n++] = TOK_CLS;
@@ -827,7 +922,7 @@ static float logsoftmax_at(const float *lg, int id)
 
 /* 输入能不能整个切成完整音节（最后一个音节允许只打了前半）。n、m、ng 这类没有元音的读音不算，
  * 否则 "nh" 会被当成"嗯 + h…"。切不开时才按简拼解码，能切开的全拼输入不受简拼影响。 */
-static int full_pinyin(const E2EModel *m, const char *inp, int L, int use_alt)
+static int full_pinyin(const E2EModel *m, const char *inp, const char *sep, int L, int use_alt)
 {
     char ok[257] = { 1 };
     for (int i = 0; i < L; i++) {
@@ -840,10 +935,13 @@ static int full_pinyin(const E2EModel *m, const char *inp, int L, int use_alt)
             for (int a = -1; a < (use_alt ? g->nalt : 0); a++) {
                 const char *r = a < 0 ? g->r : g->alt[a];
                 int len = (int)strlen(r);
-                if (len <= L - i && !memcmp(inp + i, r, (size_t)len))
-                    ok[i + len] = 1;
-                else if (len > L - i && !memcmp(r, inp + i, (size_t)(L - i)))
-                    ok[L] = 1;
+                if (len <= L - i && !memcmp(inp + i, r, (size_t)len)) {
+                    if (!crosses_sep(sep, i, len))
+                        ok[i + len] = 1;
+                } else if (len > L - i && !memcmp(r, inp + i, (size_t)(L - i))) {
+                    if (!crosses_sep(sep, i, L - i))
+                        ok[L] = 1;
+                }
             }
         }
         if (ok[L])
@@ -854,21 +952,23 @@ static int full_pinyin(const E2EModel *m, const char *inp, int L, int use_alt)
 
 int e2e_is_jianpin(E2EModel *m, const char *letters)
 {
-    char inp[256];
-    int L = 0;
-    for (const char *p = letters; *p && L < 255; p++) {
-        char c = *p;
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c >= 'a' && c <= 'z') inp[L++] = c;
-    }
-    return m->jianpin && L > 0 && !full_pinyin(m, inp, L, 0);   /* 不看模糊拼写：可以和换模糊音表的解码线程并发 */
+    char inp[256], sep[257];
+    int L = extract_inp(letters, inp, sep);
+    return m->jianpin && L > 0 && !full_pinyin(m, inp, sep, L, 0);   /* 不看模糊拼写：可以和换模糊音表的解码线程并发 */
+}
+
+int e2e_is_jianpin_fuzzy(E2EModel *m, const char *letters)
+{
+    char inp[256], sep[257];
+    int L = extract_inp(letters, inp, sep);
+    return m->jianpin && L > 0 && !full_pinyin(m, inp, sep, L, 1);
 }
 
 /* 按模糊音开关给读音 r 生成其他拼写（不含 r 本身），写进 out，返回个数 */
 static int fuzzy_spellings(const char *r, uint32_t mask, char out[][8], int max)
 {
-    /* 声母：原样 + 模糊的另一个 */
-    char ini[2][3] = { "", "" }, fin[2][8] = { "", "" };
+    /* 声母：原样 + 模糊的另一个（l 同时开 n/l 与 r/l 时需要 3 格） */
+    char ini[3][3] = { "", "", "" }, fin[2][8] = { "", "" };
     int ni = 1, nf = 1;
     int il = (r[1] == 'h' && (r[0] == 'z' || r[0] == 'c' || r[0] == 's')) ? 2 :
              strchr("bpmfdtnlgkhjqxrzcsyw", r[0]) ? 1 : 0;
@@ -879,7 +979,7 @@ static int fuzzy_spellings(const char *r, uint32_t mask, char out[][8], int max)
     static const struct { int bit; const char *a, *b; } I[] = {
         { 9, "z", "zh" }, { 7, "c", "ch" }, { 8, "s", "sh" }, { 0, "n", "l" }, { 1, "r", "l" }, { 2, "h", "f" }, { 3, "g", "k" },
     };
-    for (size_t k = 0; k < sizeof(I) / sizeof(I[0]) && ni < 2; k++)
+    for (size_t k = 0; k < sizeof(I) / sizeof(I[0]) && ni < 3; k++)
         if (mask >> I[k].bit & 1) {
             if (!strcmp(ini[0], I[k].a)) snprintf(ini[ni++], 3, "%s", I[k].b);
             else if (!strcmp(ini[0], I[k].b)) snprintf(ini[ni++], 3, "%s", I[k].a);
@@ -895,10 +995,6 @@ static int fuzzy_spellings(const char *r, uint32_t mask, char out[][8], int max)
         int ends_a = !ends_b && fl >= la && !strcmp(f + fl - la, F[k].a);
         if (!(ends_a || ends_b))
             continue;
-        if (k >= 2 && ((ends_a && fl > la && (f[fl - la - 1] == 'i' || f[fl - la - 1] == 'u')) ||
-                       (ends_b && fl > lb && (f[fl - lb - 1] == 'i' || f[fl - lb - 1] == 'u'))) &&
-            (F[k].a[0] == 'a'))
-            continue;                                      /* ian/uan 归上面两条管 */
         if (!(mask >> F[k].bit & 1))
             break;
         size_t keep = fl - (ends_b ? lb : la);
@@ -937,11 +1033,11 @@ void e2e_set_jianpin(E2EModel *m, int on, float penalty)
 int e2e_score(E2EModel *m, const char *context, const char *letters, const char *text, float *score)
 {
     char inp[256];
-    if (setup_prompt(m, context, letters, inp) <= 0)
+    if (setup_prompt(m, context, letters, inp, NULL) <= 0)
         return -1;
     int tok[256];
     int n = encode(&m->vocab, text, tok, 255);
-    if (n <= 0)
+    if (n <= 0 || m->plen + n > PMAX)
         return -1;
     if (m->be->reserve(m->be, PMAX + n) < 0)
         return -1;
@@ -984,8 +1080,8 @@ int e2e_decode(E2EModel *m, const char *context, const char *letters, int beam,
     double t0 = now_ms();
     if (beam < 1) beam = 1;
     if (beam > MAXBEAM) beam = MAXBEAM;
-    char inp[256];
-    int L = setup_prompt(m, context, letters, inp);
+    char inp[256], sep[257];
+    int L = setup_prompt(m, context, letters, inp, sep);
     if (L <= 0)
         return 0;
 
@@ -1003,12 +1099,14 @@ int e2e_decode(E2EModel *m, const char *context, const char *letters, int beam,
     Hyp beams[MAXBEAM];
     int nb = 1;
     beams[0] = (Hyp){ 0.0f, NULL, 0, 0, 0, NULL, m->last_logits };
-    int jp = m->jianpin && !full_pinyin(m, inp, L, 1);            /* 这次按简拼解码 */
+    int jp = m->jianpin && !full_pinyin(m, inp, sep, L, 1);       /* 这次按简拼解码 */
     int cap = beam * (jp ? 400 : 64) * beam + 16;    /* 简拼时一个字母能匹配几十个读音 */
     Hyp *cand = malloc(sizeof(Hyp) * (size_t)cap);
     int result = 0;
 
     for (int stepi = 0; stepi <= L; stepi++) {
+        if (m->plen + stepi >= PMAX)
+            break;
         if (cancel && *cancel) {
             free(cand);
             return -1;
@@ -1042,7 +1140,7 @@ int e2e_decode(E2EModel *m, const char *context, const char *letters, int beam,
                         c = len;
                     else if (len > rl && !memcmp(r, rest, (size_t)rl))
                         c = rl;
-                    if (c > 0) {
+                    if (c > 0 && !crosses_sep(sep, h->p, c)) {
                         int dup = 0;
                         for (int q = 0; q < no; q++) dup |= opt[q] == c && !pen[q];
                         if (!dup) opt[no] = c, pen[no++] = 0;
@@ -1050,7 +1148,8 @@ int e2e_decode(E2EModel *m, const char *context, const char *letters, int beam,
                     if (jp && rest[0] == r[0]) {
                         int zcs = r[1] == 'h' && (r[0] == 'z' || r[0] == 'c' || r[0] == 's');
                         for (int kk = 1; kk <= 2; kk++)
-                            if (kk < len && kk < rl && (kk == 1 || (zcs && rest[1] == 'h'))) {
+                            if (kk < len && kk < rl && (kk == 1 || (zcs && rest[1] == 'h')) &&
+                                !crosses_sep(sep, h->p, kk)) {
                                 int dup = 0;
                                 for (int q = 0; q < no; q++) dup |= opt[q] == kk;
                                 if (!dup) opt[no] = kk, pen[no++] = 1;

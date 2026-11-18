@@ -92,11 +92,23 @@ fn parse_ctl(line: &str) -> Option<Ctl> {
     }
 }
 
+const MAX_CTL_LINE: usize = 1 << 20;
+
+async fn read_line_capped(rd: &mut BufReader<tokio::net::unix::OwnedReadHalf>, out: &mut String) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    out.clear();
+    let n = rd.take((MAX_CTL_LINE + 1) as u64).read_line(out).await?;
+    if out.len() > MAX_CTL_LINE {
+        return Err(std::io::Error::other("line too long"));
+    }
+    Ok(n)
+}
+
 async fn serve_client(stream: UnixStream, ctl: mpsc::UnboundedSender<(Ctl, Reply)>) {
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
     let mut line = String::new();
-    if rd.read_line(&mut line).await.unwrap_or(0) == 0 {
+    if read_line_capped(&mut rd, &mut line).await.unwrap_or(0) == 0 {
         return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
@@ -122,7 +134,7 @@ async fn serve_client(stream: UnixStream, ctl: mpsc::UnboundedSender<(Ctl, Reply
                 }
                 None => break,
             },
-            n = rd.read_line(&mut rest) => {
+            n = read_line_capped(&mut rd, &mut rest) => {
                 if n.unwrap_or(0) == 0 {
                     break;
                 }
@@ -280,6 +292,8 @@ struct State<'a> {
     group: Group,
     /// 最近一次同步过的剪贴板指纹（文本本身或图片 md5），用来防回声
     last_clip: Option<String>,
+    /// 刚写入远端图片后忽略短时间内桌面转码衍生出的新 PNG（防回声循环）
+    ignore_image_echo_until: Option<Instant>,
     persist: &'a mut Persist,
     http: reqwest::Client,
 }
@@ -316,17 +330,19 @@ impl State<'_> {
     }
 }
 
-async fn refresh_group(st: &mut State<'_>) {
+async fn refresh_group(st: &mut State<'_>) -> bool {
     match st.session.group(1, 0).await {
         Ok(g) => {
             let was = st.paired();
             st.group = g;
             if st.paired() != was {
                 log!("paired={} group={}", st.paired(), st.group.group_id);
+                return st.paired();
             }
         }
         Err(e) => log!("group refresh failed: {e}"),
     }
+    false
 }
 
 /// 只接受腾讯云 COS / qq.com 的 https 链接，防止被推一个任意 URL 让我们去下载。
@@ -402,7 +418,15 @@ async fn on_local_clip(st: &mut State<'_>) {
     if st.last_clip.as_deref() == Some(fp.as_str()) {
         return;
     }
-    st.last_clip = Some(fp);
+    // 刚从手机写入图片后，Klipper 等桌面组件可能自动转码出 image/png 触发新通知：忽略这轮回声并记住新指纹
+    if matches!(c, Content::Image { .. }) {
+        if let Some(until) = st.ignore_image_echo_until.take() {
+            if Instant::now() <= until {
+                st.last_clip = Some(fp);
+                return;
+            }
+        }
+    }
     let gid = st.group.group_id;
     let r = match c {
         Content::Text(text) => st.session.send_clip_text(gid, &text).await.map(|v| (v, format!("{} chars", text.chars().count()))),
@@ -423,6 +447,7 @@ async fn on_local_clip(st: &mut State<'_>) {
     };
     match r {
         Ok((ver, what)) => {
+            st.last_clip = Some(fp);
             st.persist.sent += 1;
             st.persist.clip_version = Some(ver);
             log!("clipboard -> peer ({what}, version {ver})");
@@ -457,9 +482,9 @@ async fn apply_remote(st: &mut State<'_>, clip: Clip) {
         if st.last_clip.as_deref() == Some(text.as_str()) {
             return;
         }
-        st.last_clip = Some(text.clone());
         match clipboard::write_text(&text).await {
             Ok(()) => {
+                st.last_clip = Some(text.clone());
                 st.persist.received += 1;
                 log!("clipboard <- peer ({} chars, version {})", text.chars().count(), clip.version);
             }
@@ -492,9 +517,10 @@ async fn apply_remote(st: &mut State<'_>, clip: Clip) {
     let Some(mime) = clipboard::image_mime(&data) else {
         return log!("peer image: unknown format (head {})", hex::encode(&data[..data.len().min(16)]));
     };
-    st.last_clip = Some(format!("img:{}", minime_netd::crypto::md5_upper(&data)));
     match clipboard::write_image(mime, &data).await {
         Ok(()) => {
+            st.last_clip = Some(format!("img:{}", minime_netd::crypto::md5_upper(&data)));
+            st.ignore_image_echo_until = Some(Instant::now() + Duration::from_secs(3));
             st.persist.received += 1;
             log!("clipboard <- peer (image {} KB, version {})", data.len() / 1024, clip.version);
         }
@@ -704,19 +730,28 @@ async fn pair_show_code(s: Arc<Session>, reply: Reply) -> Res<u64> {
 /// 输码方：输入对方（手机）显示的码，等对方确认。
 async fn pair_enter_code(s: Arc<Session>, peer_code: String, reply: Reply) -> Res<u64> {
     let (self_code, _) = s.match_code().await?;
-    s.bind_code(&peer_code, &self_code).await?;
+    if let Err(e) = s.bind_code(&peer_code, &self_code).await {
+        let _ = s.release_code(&self_code).await;
+        return Err(e);
+    }
     let _ = reply.send(info("请在另一台设备上确认关联"));
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if reply.is_closed() {
+            let _ = s.release_code(&self_code).await;
             return Err("cancelled".into());
         }
-        let g = s.group(1, 0).await?;
-        if g.group_id != 0 && g.devices.iter().any(|d| d.uin != s.uin()) {
-            return Ok(g.group_id);
+        match s.group(1, 0).await {
+            Ok(g) if g.group_id != 0 && g.devices.iter().any(|d| d.uin != s.uin()) => return Ok(g.group_id),
+            Ok(_) => {}
+            Err(e) => {
+                let _ = s.release_code(&self_code).await;
+                return Err(e);
+            }
         }
     }
+    let _ = s.release_code(&self_code).await;
     Err("超时，对方没有确认".into())
 }
 
@@ -750,13 +785,15 @@ async fn handle_ctl(st: &mut State<'_>, c: Ctl, reply: Reply, refresh: &mpsc::Un
             });
         }
         Ctl::Rename(name) => {
-            let name = name.trim().to_string();
+            let name = name.trim().chars().take(32).collect::<String>();
             if name.is_empty() {
                 let _ = reply.send(err("用法：rename <设备名>"));
                 return;
             }
             let _ = reply.send(match st.session.update_device_info(Some(&name), &[]).await {
                 Ok(0) => {
+                    st.cfg.device_name = name.clone();
+                    st.session.set_device_name(&name);
                     refresh_group(st).await;
                     json!({"type": "ok", "renamed": name})
                 }
@@ -848,6 +885,7 @@ async fn handle_ctl(st: &mut State<'_>, c: Ctl, reply: Reply, refresh: &mpsc::Un
 
 async fn run_session(
     cfg: &Config,
+    mut cfg_mtime: Option<std::time::SystemTime>,
     ctl_rx: &mut mpsc::UnboundedReceiver<(Ctl, Reply)>,
     persist: &mut Persist,
     shared: &EngineNet,
@@ -891,7 +929,15 @@ async fn run_session(
         user_dict: cfg.user_dict,
         http: reqwest::Client::builder().timeout(Duration::from_secs(120)).build().unwrap_or_default(),
     });
-    let mut st = State { session: session.clone(), cfg: cfg.clone(), group: Group::default(), last_clip: None, persist, http };
+    let mut st = State {
+        session: session.clone(),
+        cfg: cfg.clone(),
+        group: Group::default(),
+        last_clip: None,
+        ignore_image_echo_until: None,
+        persist,
+        http,
+    };
     refresh_group(&mut st).await;
     // 设备名同步到组里（sub 79）：设置里改名后会重连，走到这里就生效
     if st.paired() {
@@ -947,7 +993,6 @@ async fn run_session(
     let mut hb = tokio::time::interval(HEARTBEAT);
     hb.tick().await;
     let mut cfg_tick = tokio::time::interval(CONFIG_POLL);
-    let mut cfg_mtime = config::mtime();
 
     let exit = loop {
         tokio::select! {
@@ -955,10 +1000,19 @@ async fn run_session(
                 Some(frame) => on_push(&mut st, &frame, &refresh_tx).await,
                 None => break Exit::Lost("connection closed".into()),
             },
-            Some(()) = async { match clip_rx.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => {
-                on_local_clip(&mut st).await;
+            res = async { match clip_rx.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => match res {
+                Some(()) => on_local_clip(&mut st).await,
+                None => {
+                    log!("wl-paste --watch exited; clipboard watch disabled");
+                    clip_rx = None;
+                }
+            },
+            Some(()) = refresh_rx.recv() => {
+                if refresh_group(&mut st).await {
+                    sync_hot_words(&mut st).await;
+                    engine_dict_sync(&mut st, "paired").await;
+                }
             }
-            Some(()) = refresh_rx.recv() => refresh_group(&mut st).await,
             Some((c, reply)) = ctl_rx.recv() => handle_ctl(&mut st, c, reply, &refresh_tx).await,
             _ = hb.tick() => {
                 if let Err(e) = session.heartbeat().await {
@@ -966,7 +1020,10 @@ async fn run_session(
                 }
                 // 对端在手机上增删设备时不一定有推送（实测删除设备没收到 event 6），
                 // 和官方客户端一样定期拉组信息
-                refresh_group(&mut st).await;
+                if refresh_group(&mut st).await {
+                    sync_hot_words(&mut st).await;
+                    engine_dict_sync(&mut st, "paired").await;
+                }
                 if st.persist.dict_sync_at.map(|t| t.elapsed() > DICT_SYNC_EVERY).unwrap_or(true) {
                     engine_dict_sync(&mut st, "timer").await;
                 }
@@ -1057,7 +1114,10 @@ fn spawn_engine_net(shared: EngineNet) -> std::io::Result<()> {
                     }
                     let f = |i: usize| u32::from_le_bytes(hdr[i..i + 4].try_into().unwrap());
                     let (len, task, cmd, sub, timeout) = (f(0), f(4), f(8) as i32, f(12) as i32, f(16));
-                    let mut body = vec![0u8; len.saturating_sub(16) as usize];
+                    if len < 16 || len > (32 << 20) {
+                        break;
+                    }
+                    let mut body = vec![0u8; (len - 16) as usize];
                     if rd.read_exact(&mut body).await.is_err() {
                         break;
                     }
@@ -1210,14 +1270,13 @@ async fn daemon() -> i32 {
     let mut persist = Persist::default();
     let mut backoff = Duration::from_secs(1);
     loop {
-        let (cfg, _) = config::load();
+        let (cfg, cfg_mtime) = config::load();
         if !cfg.enabled {
             // 不联网：只回答控制命令，等配置打开
-            let m0 = config::mtime();
             loop {
                 tokio::select! {
                     Some((c, r)) = ctl_rx.recv() => idle_reply(c, r, &cfg, "network disabled"),
-                    _ = tokio::time::sleep(CONFIG_POLL) => if config::mtime() != m0 { break },
+                    _ = tokio::time::sleep(CONFIG_POLL) => if config::mtime() != cfg_mtime { break },
                 }
             }
             continue;
@@ -1225,18 +1284,17 @@ async fn daemon() -> i32 {
         if !minime_netd::crypto::keys_ready() {
             // 协议常量从官方 ime_net.dll 里读；还没有用 minime-fetch 下载时先等着，下载后自动连上
             log!("official files not found (run minime-fetch); waiting");
-            let m0 = config::mtime();
             let until = Instant::now() + Duration::from_secs(30);
             while Instant::now() < until {
                 tokio::select! {
                     Some((c, r)) = ctl_rx.recv() => idle_reply(c, r, &cfg, "official files missing: run minime-fetch"),
-                    _ = tokio::time::sleep(CONFIG_POLL) => if config::mtime() != m0 { break },
+                    _ = tokio::time::sleep(CONFIG_POLL) => if config::mtime() != cfg_mtime { break },
                 }
             }
             continue;
         }
         let started = Instant::now();
-        match run_session(&cfg, &mut ctl_rx, &mut persist, &engine_net).await {
+        match run_session(&cfg, cfg_mtime, &mut ctl_rx, &mut persist, &engine_net).await {
             Exit::ConfigChanged => {
                 log!("config changed");
                 backoff = Duration::from_secs(1);

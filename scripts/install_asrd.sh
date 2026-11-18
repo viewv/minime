@@ -21,29 +21,9 @@ SOCK=$HOME/.config/systemd/user/minime-asrd.socket
 (cd "$R/asrd" && cargo build --release)
 "$BIN" fetch-model
 mkdir -p "$(dirname "$UNIT")"
-cat > "$UNIT" <<EOF
-[Unit]
-Description=MinIME 离线语音（本地识别，不联网）
-Documentation=file://$R/docs/voice.md
-After=graphical-session.target pipewire.service
-
-[Service]
-ExecStart=$BIN
-Restart=on-failure
-RestartSec=5
-EOF
-cat > "$SOCK" <<EOF
-[Unit]
-Description=MinIME 离线语音（按需启动）
-Documentation=file://$R/docs/voice.md
-
-[Socket]
-ListenStream=%t/minime-asrd.sock
-SocketMode=0600
-
-[Install]
-WantedBy=sockets.target
-EOF
+# 单元文件直接用软件包里的那两份，只换程序路径：本机和用户装完的一样
+sed "s|^ExecStart=/usr/bin/minime-asrd\$|ExecStart=$BIN|" "$R/packaging/systemd/minime-asrd.service" > "$UNIT"
+cp "$R/packaging/systemd/minime-asrd.socket" "$SOCK"
 # 早先的版本把服务设成了登录自启：改成按需启动
 systemctl --user disable minime-asrd.service 2>/dev/null || true
 # 改名前（wetype）的服务：停掉、取消自启、删掉单元文件

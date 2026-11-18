@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-minime VERSION 0.1.4 LANGUAGES CXX)
+project(fcitx5-minime VERSION 0.2.0 LANGUAGES CXX)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +20,7 @@ struct W : fcitx::CandidateWord { W() : CandidateWord(fcitx::Text(\"a\")) { setC
 int main() { W w; return 0; }" MINIME_HAVE_CANDIDATE_COMMENT)
 check_cxx_source_compiles("
 #include <fcitx/instance.h>
-int main() { fcitx::Instance *i = nullptr; i->showCustomInputMethodInformation(nullptr, \"x\"); return 0; }" MINIME_HAVE_CUSTOM_INFO)
+int main() { return (int)sizeof(&fcitx::Instance::showCustomInputMethodInformation); }" MINIME_HAVE_CUSTOM_INFO)
 check_cxx_source_compiles("
 #include <fcitx/candidateaction.h>
 int main() { fcitx::CandidateAction a; a.setId(0); return 0; }" MINIME_HAVE_CANDIDATE_ACTIONS)

@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 
 pub fn dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"));
     base.join("minime/dicts")
 }
 
@@ -97,14 +99,16 @@ pub fn guess_kind(name: &str) -> u32 {
     }
 }
 
-/// 导入：复制到 dicts/imported/ 下，返回新路径。
+/// 导入：原子复制到 dicts/imported/ 下，返回新路径。
 pub fn import(src: &Path) -> std::io::Result<PathBuf> {
     let d = dir().join("imported");
     std::fs::create_dir_all(&d)?;
     let name = src.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
     let dst = d.join(name);
     if dst != src {
-        std::fs::copy(src, &dst)?;
+        let tmp = d.join(format!("{}.tmp", name.to_string_lossy()));
+        std::fs::copy(src, &tmp)?;
+        std::fs::rename(&tmp, &dst)?;
     }
     Ok(dst)
 }
@@ -186,6 +190,15 @@ pub struct CoreConf {
     pub replace: BTreeMap<String, String>,
     /// 路径 -> typeId
     pub add: BTreeMap<String, u32>,
+}
+
+impl CoreConf {
+    /// 去掉已关闭词库上的 replace（engined 会跳过关闭的词库，不写替换路径到 core_state.tsv）
+    pub fn effective(&self) -> CoreConf {
+        let mut c = self.clone();
+        c.replace.retain(|k, _| !c.off.contains(k));
+        c
+    }
 }
 
 /// 由引擎实际加载的结果反推出当时用的配置（用来判断「有没有待生效的改动」和「放弃改动」）
@@ -334,7 +347,11 @@ pub fn other_info(name: &str) -> (&'static str, &'static str) {
 
 pub fn cell_info(path: &str) -> (String, String) {
     let n = file_name(path);
-    let n = n.split_once('_').filter(|(h, _)| h.len() == 8).map(|(_, t)| t).unwrap_or(n); // 库房文件带 md5 前缀
+    let n = n
+        .split_once('_')
+        .filter(|(h, _)| h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|(_, t)| t)
+        .unwrap_or(n); // 库房文件带 md5 前缀
     let known: &[(&str, &str, &str)] = &[
         ("cell_dict.hf.", "高频短语", "聊天里常用的口语短语（如「阳了」）"),
         ("cell_dict.sc.", "符号", "用拼音打出 ♠ ♥ → 等符号"),

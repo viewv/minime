@@ -149,18 +149,25 @@ static void cells_load(void)
     state_path(sp, sizeof(sp), "state.tsv");
     struct stat st;
     if (stat(cp, &st) != 0) {
-        FILE *f = fopen(cp, "w");                      /* 默认：内置的全部启用 */
+        char cp_tmp[MAX_PATH + 8];
+        snprintf(cp_tmp, sizeof(cp_tmp), "%s.tmp", cp);
+        FILE *f = fopen(cp_tmp, "w");                      /* 默认：内置的全部启用 */
         if (f) {
             for (int i = 0; i < g_ncell_builtin; i++)
                 fprintf(f, "1\t%u\t%s\n", g_cell_builtin[i].type, g_cell_builtin[i].path);
-            fclose(f);
+            if (fclose(f) == 0)
+                rename(cp_tmp, cp);
+            else
+                remove(cp_tmp);
         }
         stat(cp, &st);
     }
     g_cells_mtime = st.st_mtim;
     if (wx.clear_cell_dicts)
         wx.clear_cell_dicts();
-    FILE *f = fopen(cp, "r"), *out = fopen(sp, "w");
+    char sp_tmp[MAX_PATH + 8];
+    snprintf(sp_tmp, sizeof(sp_tmp), "%s.tmp", sp);
+    FILE *f = fopen(cp, "r"), *out = fopen(sp_tmp, "w");
     char line[MAX_PATH + 32];
     int n = 0, nok = 0;
     while (f && fgets(line, sizeof(line), f)) {
@@ -196,8 +203,12 @@ static void cells_load(void)
     }
     if (f)
         fclose(f);
-    if (out)
-        fclose(out);
+    if (out) {
+        if (fclose(out) == 0)
+            rename(sp_tmp, sp);
+        else
+            remove(sp_tmp);
+    }
     fprintf(stderr, "[engine] 细胞词库 %d/%d 个加载成功（%s）\n", nok, n, cp);
 }
 
@@ -233,6 +244,12 @@ int wx_engine_open(const char *install_dir, const char *work_dir_in)
         fprintf(stderr, "[engine] 装载 %s/libwxhld.dll 失败\n", install_dir);
         return -1;
     }
+#ifndef _WIN32
+    if (getenv("MINIME_TFLITE_TRACE")) {
+        void tflite_trace_install(pe_module *eng);
+        tflite_trace_install(h);
+    }
+#endif
 
     pfn_wxime_size_check size_check = sym(h, "wxime_size_check");
     pfn_wxime_initialize initialize = sym(h, "wxime_initialize");
@@ -412,7 +429,7 @@ int wx_engine_open(const char *install_dir, const char *work_dir_in)
     }
     /* 用户词库目录必须和工作目录下的 user_dict/ 分开：引擎启动时把 <工作目录>/user_dict 当成
      * 每实例 mmap 的临时目录清空（"Clean up …/user_dict"），放在那里的用户词库每次启动都被删掉。
-     * 官方布局是工作目录 ImeDir/ 加独立的 DictDir2/（见 开发笔记（未公开））。 */
+     * 官方布局是工作目录 ImeDir/ 加独立的 DictDir2/（见 docs/architecture.md）。 */
     static char user_dict_dir[MAX_PATH];
     snprintf(user_dict_dir, MAX_PATH, "%s%cDictDir2", work_dir, PLAT_SEP);
     plat_mkdir(user_dict_dir);
@@ -445,8 +462,10 @@ int wx_engine_open(const char *install_dir, const char *work_dir_in)
 
     /* 核心词库清单写给设置程序看（只读展示） */
     {
-        char cp[MAX_PATH];
-        FILE *f = fopen(state_path(cp, sizeof(cp), "core_state.tsv"), "w");
+        char cp[MAX_PATH], cp_tmp[MAX_PATH + 8];
+        state_path(cp, sizeof(cp), "core_state.tsv");
+        snprintf(cp_tmp, sizeof(cp_tmp), "%s.tmp", cp);
+        FILE *f = fopen(cp_tmp, "w");
         if (f) {
             for (int i = 0; i < ndict; i++)
                 fprintf(f, "%d\t%d\t%d\t%s\t%s\n", core_state[i] ? core_state[i] : 3, dicts[i].id,
@@ -456,7 +475,10 @@ int wx_engine_open(const char *install_dir, const char *work_dir_in)
                 fprintf(f, "0\t%.*s\t%d\t%s\t\n", (int)(t - g_off_list[i]), g_off_list[i],
                         entries_version_of(entries, ndict0, t + 1), t + 1);
             }
-            fclose(f);
+            if (fclose(f) == 0)
+                rename(cp_tmp, cp);
+            else
+                remove(cp_tmp);
         }
     }
     /* 细胞词库：按 ~/.local/share/minime/dicts/cells.tsv 加载（没有就用内置的生成默认配置） */

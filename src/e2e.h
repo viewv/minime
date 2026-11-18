@@ -41,6 +41,8 @@ void e2e_set_jianpin(E2EModel *m, int on, float penalty);
 void e2e_set_fuzzy(E2EModel *m, uint32_t mask);
 /* 这串字母会不会按简拼解码（打开了简拼、并且切不成完整音节）。只读读音表，可以和解码并发调用。 */
 int e2e_is_jianpin(E2EModel *m, const char *letters);
+/* 仅限持有模糊拼写表同一线程调用：把模糊音扩展也算进全拼切分判断（和 e2e_decode 保持一致） */
+int e2e_is_jianpin_fuzzy(E2EModel *m, const char *letters);
 
 void e2e_close(E2EModel *m);
 

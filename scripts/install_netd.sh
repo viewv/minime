@@ -16,20 +16,8 @@ UNIT=$HOME/.config/systemd/user/minime-netd.service
 
 (cd "$R/netd" && cargo build --release)
 mkdir -p "$(dirname "$UNIT")"
-cat > "$UNIT" <<EOF
-[Unit]
-Description=MinIME 网络服务（跨设备剪贴板，默认关闭）
-Documentation=file://$R/docs/cross-device.md
-After=graphical-session.target
-
-[Service]
-ExecStart=$BIN
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-EOF
+# 单元文件直接用软件包里的那份，只换程序路径：本机和用户装完的一样
+sed "s|^ExecStart=/usr/bin/minime-netd\$|ExecStart=$BIN|" "$R/packaging/systemd/minime-netd.service" > "$UNIT"
 # 改名前（wetype）的服务：停掉、取消自启、删掉单元文件
 for u in wetype-netd.service; do
   if [ -e "$HOME/.config/systemd/user/$u" ]; then

@@ -85,6 +85,13 @@ pub fn load() -> HotWords {
     std::fs::read_to_string(path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
+fn write_private(p: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+    f.write_all(data)
+}
+
 /// 原子写。engined 读这个文件（mtime 变化即重载）。
 pub fn save(h: &HotWords) -> std::io::Result<()> {
     let p = path();
@@ -92,17 +99,18 @@ pub fn save(h: &HotWords) -> std::io::Result<()> {
         std::fs::create_dir_all(d)?;
     }
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(h)?)?;
+    write_private(&tmp, serde_json::to_string_pretty(h)?.as_bytes())?;
     std::fs::rename(tmp, &p)?;
-    // engined 读的简化版：每行 `快捷字母<TAB>短语`，短语里的 \\ \t \n 转义
+    // engined 读的简化版：每行 `快捷字母<TAB>短语`，短语里的 \\ \t \n \r 转义
     let mut tsv = String::new();
     for it in &h.items {
-        let esc = it.text.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
-        tsv.push_str(&format!("{}\t{}\n", it.key, esc));
+        let key = it.key.replace(['\t', '\n', '\r'], "");
+        let esc = it.text.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n").replace('\r', "\\r");
+        tsv.push_str(&format!("{key}\t{esc}\n"));
     }
     let tsv_path = p.with_extension("tsv");
     let tmp = p.with_extension("tsv.tmp");
-    std::fs::write(&tmp, tsv)?;
+    write_private(&tmp, tsv.as_bytes())?;
     std::fs::rename(tmp, tsv_path)
 }
 

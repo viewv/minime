@@ -1,6 +1,6 @@
 [package]
 name = "minime-settings"
-version = "0.1.4"
+version = "0.2.0"
 license = "MPL-2.0"
 edition = "2021"
 description = "MinIME 设置（GPUI）"

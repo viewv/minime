@@ -4,7 +4,8 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -17,8 +18,10 @@ pub const ITEMS: [(&str, &str, &str, &str); 3] = [
 
 fn data_home() -> PathBuf {
     std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"))
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share"))
 }
 
 /// 和 minime-fetch 里的判断一致
@@ -37,22 +40,87 @@ pub fn installed(id: &str) -> bool {
     }
 }
 
-/// 找 minime-fetch：$MINIME_FETCH → PATH → 开发时仓库里的 scripts/（settings/target/release/ 往上三级）
-pub fn fetch_bin() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("MINIME_FETCH") {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("minime-fetch");
-            if p.is_file() {
-                return Some(p);
+/// 引擎服务实际用的引擎目录：引擎启动时把加载的词库路径写进 dicts/core_state.tsv（…/<引擎目录>/BuildIn/xx.bin）。
+/// 开发环境的服务直接用仓库里的 vendor/，不在 minime-fetch 的下载目录里。
+pub fn engine_dir_in_use() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(data_home().join("minime/dicts/core_state.tsv")).ok()?;
+    text.lines().find_map(|l| {
+        let p = PathBuf::from(l.split('\t').nth(4)?);
+        let dir = p.parent()?.parent()?.to_path_buf();
+        dir.join("libwxhld.dll").is_file().then_some(dir)
+    })
+}
+
+fn engined_service_env() -> String {
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    if let Ok(g) = CACHE.lock() {
+        if let Some((at, val)) = &*g {
+            if at.elapsed() < Duration::from_secs(5) {
+                return val.clone();
             }
         }
     }
-    let exe = std::env::current_exe().ok()?;
-    let p = exe.parent()?.parent()?.parent()?.parent()?.join("scripts/minime-fetch");
-    p.is_file().then_some(p)
+    let env = Command::new("systemctl")
+        .args(["--user", "show", "minime-engined.service", "-p", "Environment", "--value"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((Instant::now(), env.clone()));
+    }
+    env
+}
+
+/// 引擎服务用的整句模型目录，和 engined 的选法一致：服务环境里的 MINIME_E2E_DIR → 下载目录 → <引擎目录>/BuildIn
+pub fn e2e_dir_in_use() -> Option<PathBuf> {
+    let has = |d: &PathBuf| d.join("decgnr.bin").is_file() && d.join("mpd_e2e.bin").is_file();
+    let env = engined_service_env();
+    if let Some(d) = env.split_whitespace().find_map(|kv| kv.strip_prefix("MINIME_E2E_DIR=")) {
+        let d = PathBuf::from(d);
+        return has(&d).then_some(d);
+    }
+    let d = data_home().join("minime/official/mac/imeData");
+    if has(&d) {
+        return Some(d);
+    }
+    engine_dir_in_use().map(|e| e.join("BuildIn")).filter(has)
+}
+
+/// 能不能用：minime-fetch 下载过，或者引擎服务正在用别处的文件（开发环境）。
+/// 返回 (能用, 别处的目录——不是下载来的时候给出)
+pub fn ready(id: &str) -> (bool, Option<PathBuf>) {
+    if installed(id) {
+        return (true, None);
+    }
+    let other = match id {
+        "engine" => engine_dir_in_use(),
+        "e2e" => e2e_dir_in_use(),
+        _ => None,
+    };
+    (other.is_some(), other)
+}
+
+/// 找 minime-fetch：$MINIME_FETCH → PATH → 开发时仓库里的 scripts/（settings/target/release/ 往上三级）
+pub fn fetch_bin() -> Option<PathBuf> {
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Some(p) = std::env::var_os("MINIME_FETCH") {
+            return Some(PathBuf::from(p));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let p = dir.join("minime-fetch");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        let exe = std::env::current_exe().ok()?;
+        let p = exe.parent()?.parent()?.parent()?.parent()?.join("scripts/minime-fetch");
+        p.is_file().then_some(p)
+    })
+    .clone()
 }
 
 /// 开始一次下载（`items` 为空时只做配置：`minime-fetch setup`）。
@@ -101,11 +169,21 @@ pub fn spawn(items: &[&str], tx: mpsc::Sender<Value>) -> Result<Child, String> {
     Ok(child)
 }
 
-/// 取消：结束整个进程组（minime-fetch 和它的子进程）
-pub fn cancel(child: &mut Child) {
-    let _ = Command::new("kill").args(["-TERM", "--", &format!("-{}", child.id())]).status();
-    let _ = child.kill();
-    let _ = child.wait();
+/// 取消：先发 SIGTERM 给整个进程组让 minime-fetch 清理临时目录，超时再强杀
+pub fn cancel(mut child: Child) {
+    std::thread::spawn(move || {
+        let pgid = format!("-{}", child.id());
+        let _ = Command::new("kill").args(["-TERM", "--", &pgid]).status();
+        for _ in 0..30 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = Command::new("kill").args(["-KILL", "--", &pgid]).status();
+        let _ = child.kill();
+        let _ = child.wait();
+    });
 }
 
 /// 一项的进度

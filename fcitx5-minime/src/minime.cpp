@@ -5,7 +5,7 @@
 // 链路（回退）: fcitx5 --TCP 127.0.0.1:17890--> bridge.exe(Wine) --命名管道--> wetype_server --> libwxhld
 // 两条链路说同一个协议，帧格式相同。
 //
-// 协议与编码见 开发笔记（未公开）。要点:
+// 协议与编码见 docs/architecture.md。要点:
 //  - 会话绑定 TCP/管道连接；bridge 先发 "PID:<n>"，app_info.process_id 必须用它
 //  - 响应异步到达 -> 用 fcitx5 事件循环的 IO 事件读取，keyEvent 不阻塞
 //  - SELECT_CANDIDATE 必须带 commit=CandidateWord{value,id}
@@ -138,20 +138,29 @@ class Bridge {
 public:
     ~Bridge() { disconnect(); }
     int fd() const { return fd_; }
-    // 连的是原生服务（认 ESC 键重置会话）还是 Wine 栈（官方 server 把 ESC 当成字符，只能重连）
     bool native() const { return native_; }
     bool connected() const { return fd_ >= 0; }
 
     // 同步部分只做连接与握手（一次性，等待极短）；之后由事件循环读
     bool connectAndCreate() {
         disconnect();
+        const auto now = std::chrono::steady_clock::now();
+        if (hasLastFail_ && now - lastFail_ < std::chrono::milliseconds(500))
+            return false;
         native_ = connectUnix();
-        if (!native_ && !connectTcp()) return false;
+        if (!native_) {
+            lastFail_ = now;
+            hasLastFail_ = true;
+            return false;
+        }
         std::string meta;
         if (!recvFrame(meta, 500) || meta.rfind("PID:", 0) != 0) {
             disconnect();
+            lastFail_ = now;
+            hasLastFail_ = true;
             return false;
         }
+        hasLastFail_ = false;
         pid_ = uint32_t(strtoul(meta.c_str() + 4, nullptr, 10));
         // CREATE_SESSION（响应异步读）
         std::string v1;
@@ -177,21 +186,8 @@ public:
             disconnect();
             return false;
         }
-        return true;
-    }
-
-    // Wine 栈的 bridge
-    bool connectTcp() {
-        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd_ < 0) return false;
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = htons(port_);
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (::connect(fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0) {
-            disconnect();
-            return false;
-        }
+        int fl = ::fcntl(fd_, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd_, F_SETFL, fl | O_NONBLOCK);
         return true;
     }
 
@@ -210,7 +206,7 @@ public:
         return app;
     }
 
-    // 发送一个 CommandV1（非阻塞写，消息很小）
+    // 发送一个 CommandV1（非阻塞写，带有限等待，避免主线程卡死）
     bool send(const std::string &v1) {
         if (fd_ < 0) return false;
         std::string base;
@@ -231,24 +227,22 @@ public:
         pollfd pfd{fd_, POLLIN, 0};
         int r = ::poll(&pfd, 1, 0);
         if (r <= 0) return false;
-        return recvFrame(out, 0);
+        return recvFrame(out, 50);
     }
 
     bool recvFrame(std::string &out, int timeoutMs) {
         if (fd_ < 0) return false;
-        pollfd pfd{fd_, POLLIN, 0};
-        int r = ::poll(&pfd, 1, timeoutMs);
-        if (r <= 0) return false;
-        // 可读却读不到完整一帧 = 对端关了（服务重启等）。必须断开，
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        // 可读却读不到完整一帧 = 对端关了或半帧超时。必须断开，
         // 否则关掉的 socket 一直可读，fcitx5 的 IO 回调会空转占满 CPU。
         uint8_t hdr[4];
-        if (!readAll(hdr, 4)) {
+        if (!readAll(hdr, 4, deadline)) {
             disconnect();
             return false;
         }
         uint32_t n = uint32_t(hdr[0]) | (uint32_t(hdr[1]) << 8) | (uint32_t(hdr[2]) << 16) |
                      (uint32_t(hdr[3]) << 24);
-        if (n > (16u << 20) || (out.resize(n), !readAll(out.data(), n))) {
+        if (n > (16u << 20) || (out.resize(n), !readAll(out.data(), n, deadline))) {
             disconnect();
             return false;
         }
@@ -258,29 +252,60 @@ public:
 private:
     bool writeAll(const void *p, size_t n) {
         const char *c = static_cast<const char *>(p);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
         while (n > 0) {
             ssize_t r = ::send(fd_, c, n, MSG_NOSIGNAL);
-            if (r <= 0) return false;
-            c += r;
-            n -= r;
+            if (r > 0) {
+                c += r;
+                n -= size_t(r);
+                continue;
+            }
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                int left = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now()).count());
+                if (left <= 0) return false;
+                pollfd pfd{fd_, POLLOUT, 0};
+                int pr = ::poll(&pfd, 1, left);
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr <= 0) return false;
+                continue;
+            }
+            return false;
         }
         return true;
     }
-    bool readAll(void *p, size_t n) {
+    bool readAll(void *p, size_t n, std::chrono::steady_clock::time_point deadline) {
         char *c = static_cast<char *>(p);
         while (n > 0) {
             ssize_t r = ::recv(fd_, c, n, 0);
-            if (r <= 0) return false;
-            c += r;
-            n -= r;
+            if (r > 0) {
+                c += r;
+                n -= size_t(r);
+                continue;
+            }
+            if (r == 0) return false;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                int left = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now()).count());
+                if (left <= 0) return false;
+                pollfd pfd{fd_, POLLIN, 0};
+                int pr = ::poll(&pfd, 1, left);
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr <= 0) return false;
+                continue;
+            }
+            return false;
         }
         return true;
     }
 
     int fd_ = -1;
     bool native_ = false;
-    int port_ = 17890;
     uint32_t pid_ = 0;
+    bool hasLastFail_ = false;
+    std::chrono::steady_clock::time_point lastFail_;
 };
 
 // ---------------- 响应解析 ----------------
@@ -310,66 +335,66 @@ bool parseResp(const std::string &raw, EngineReply &out) {
             while (dr.tag(df, dw)) {
                 if (df == 1 && dw == 0) {
                     uint64_t v;
-                    if (!dr.varint(v)) break;
+                    if (!dr.varint(v)) return false;
                     rep.type = int(v);
                 } else if (df == 2 && dw == 2) {
                     std::string cl;
-                    if (!dr.bytes(cl)) break;
+                    if (!dr.bytes(cl)) return false;
                     // CandidateList{ repeated CandidateWord candidates=1; focused=2 }
                     Reader cr(reinterpret_cast<const uint8_t *>(cl.data()), cl.size());
                     uint32_t cf, cw;
                     while (cr.tag(cf, cw)) {
                         if (cf == 1 && cw == 2) {
                             std::string cwd;
-                            if (!cr.bytes(cwd)) break;
+                            if (!cr.bytes(cwd)) return false;
                             Candidate c;
                             Reader wr(reinterpret_cast<const uint8_t *>(cwd.data()), cwd.size());
                             uint32_t wf, ww;
                             while (wr.tag(wf, ww)) {
                                 if (wf == 1 && ww == 2) {
-                                    if (!wr.bytes(c.value)) break;
+                                    if (!wr.bytes(c.value)) return false;
                                 } else if (wf == 2 && ww == 2) {
-                                    if (!wr.bytes(c.id)) break;
+                                    if (!wr.bytes(c.id)) return false;
                                 } else if (wf == 9 && ww == 2) {
-                                    if (!wr.bytes(c.comment)) break;
+                                    if (!wr.bytes(c.comment)) return false;
                                 } else if (!wr.skip(ww)) {
-                                    break;
+                                    return false;
                                 }
                             }
                             rep.candidates.push_back(std::move(c));
                         } else if (cf == 2 && cw == 0) {
                             uint64_t v;
-                            if (!cr.varint(v)) break;
+                            if (!cr.varint(v)) return false;
                             rep.focused = int(v);
                         } else if (cf == 3 && cw == 0) {
                             uint64_t v;
-                            if (!cr.varint(v)) break;
+                            if (!cr.varint(v)) return false;
                             rep.hasMore = v != 0;
                         } else if (!cr.skip(cw)) {
-                            break;
+                            return false;
                         }
                     }
                 } else if (df == 3 && dw == 2) {
                     std::string pl;
-                    if (!dr.bytes(pl)) break;
+                    if (!dr.bytes(pl)) return false;
                     // PendingList{ repeated PendingWord pengdings=1 }
                     Reader pr(reinterpret_cast<const uint8_t *>(pl.data()), pl.size());
                     uint32_t pf, pw;
                     while (pr.tag(pf, pw)) {
                         if (pf == 1 && pw == 2) {
                             std::string wd;
-                            if (!pr.bytes(wd)) break;
+                            if (!pr.bytes(wd)) return false;
                             Reader wr2(reinterpret_cast<const uint8_t *>(wd.data()), wd.size());
                             uint32_t wf2, ww2;
                             uint64_t segType = 0;
                             std::string v;
                             while (wr2.tag(wf2, ww2)) {
                                 if (wf2 == 7 && ww2 == 2) {
-                                    if (!wr2.bytes(v)) break;
+                                    if (!wr2.bytes(v)) return false;
                                 } else if (wf2 == 1 && ww2 == 0) {
-                                    if (!wr2.varint(segType)) break;
+                                    if (!wr2.varint(segType)) return false;
                                 } else if (!wr2.skip(ww2)) {
-                                    break;
+                                    return false;
                                 }
                             }
                             // 原生服务：类型 6 是引擎自动切分的音节分隔（显示成 '）
@@ -377,13 +402,13 @@ bool parseResp(const std::string &raw, EngineReply &out) {
                             rep.pending += v;
                             if (segType != 6) rep.raw += v;
                         } else if (!pr.skip(pw)) {
-                            break;
+                            return false;
                         }
                     }
                 } else if (df == 4 && dw == 2) {
-                    if (!dr.bytes(rep.emit)) break;
+                    if (!dr.bytes(rep.emit)) return false;
                 } else if (!dr.skip(dw)) {
-                    break;
+                    return false;
                 }
             }
             if (rep.type) out = std::move(rep);
@@ -542,16 +567,17 @@ std::string chinesePunct(uint32_t c, bool &dq, bool &sq) {
     }
 }
 
-// UTF-8：前 n 个字符占多少字节
-size_t utf8Bytes(const std::string &s, size_t nchars) {
-    size_t i = 0;
+// UTF-8：从字节下标 start 起前 nchars 个字符结束的字节下标
+size_t utf8Bytes(const std::string &s, size_t start, size_t nchars) {
+    size_t i = start;
     while (i < s.size() && nchars) {
         unsigned char c = static_cast<unsigned char>(s[i]);
-        i += c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+        i += c < 0x80 ? 1 : (c & 0xe0) == 0xc0 ? 2 : (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 1;
         nchars--;
     }
     return i < s.size() ? i : s.size();
 }
+size_t utf8Bytes(const std::string &s, size_t nchars) { return utf8Bytes(s, 0, nchars); }
 size_t utf8Count(const std::string &s) {
     size_t n = 0;
     for (unsigned char c : s)
@@ -644,6 +670,7 @@ public:
     }
     void deactivate(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) override {
         // 切走输入法：丢弃未完成的组合（引擎也要清，否则下次接着旧拼音打）
+        shiftAlone_ = false;
         if (voiceActive()) voiceCancel();
         disarmHold(false);
         if (isComposing()) resetEngine();
@@ -659,6 +686,7 @@ public:
     }
     // 失去焦点、应用要求重置时调用
     void reset(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) override {
+        shiftAlone_ = false;
         if (voiceActive() && voiceIc_.get() == event.inputContext()) voiceCancel();   // 失焦：丢掉这次说话
         if (holdArmed_ && holdIc_.get() == event.inputContext()) disarmHold(false);
         if (isComposing()) resetEngine();
@@ -686,7 +714,8 @@ public:
         }
 
         // 语音输入：说话中接管键盘（松开语音键/再按一次/回车 = 结束，Esc = 取消，其他键忽略）
-        if (voiceActive()) {
+        // 已经进入停录识别中（voiceStopping_）时不再拦截普通键，仅保留 Esc 取消，避免抢打字丢键
+        if (voiceActive() && (!voiceStopping_ || (!keyEvent.isRelease() && sym == FcitxKey_Escape))) {
             if (keyEvent.isRelease()) {
                 if (sym == voiceSym_ && !voiceReleased_) {
                     voiceReleased_ = true;
@@ -731,15 +760,18 @@ public:
             return;
         }
 
-        // 单按 Shift 切换中英文（配置里打开才有）：按下 Shift、中间没按别的键就松开算一次
+        // 单按 Shift 切换中英文（配置里打开才有）：按下 Shift、中间没按别的键（且未按其他修饰键）就松开算一次
         if (*config_.shiftToggle) {
             const bool isShift = sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
+            const bool anyOtherMod = states.testAny(fcitx::KeyStates{
+                fcitx::KeyState::Ctrl, fcitx::KeyState::Alt, fcitx::KeyState::Super,
+                fcitx::KeyState::Super2, fcitx::KeyState::Hyper, fcitx::KeyState::Meta});
             if (isShift && !keyEvent.isRelease()) {
-                shiftAlone_ = true;
+                shiftAlone_ = !anyOtherMod;
                 return;
             }
             if (isShift && keyEvent.isRelease()) {
-                if (shiftAlone_) toggleEnglish(ic);
+                if (shiftAlone_ && !anyOtherMod) toggleEnglish(ic);
                 shiftAlone_ = false;
                 return;
             }
@@ -821,6 +853,8 @@ public:
                 sendLetter(char(sym));      // 大写字母原样给引擎：它认得 iPhone、PDF 这类（woyongiPhone → 我用iPhone）
             } else if (sym == FcitxKey_semicolon && semicolonIsKey()) {
                 sendLetter(';');
+            } else if (sym == FcitxKey_apostrophe && !shift && scheme() != 2) {
+                sendLetter('\'');           // 拼音分词符（xi'an → 西安，fan'gan → 反感）
             } else if (sym >= FcitxKey_1 && sym <= FcitxKey_9) {
                 if (int(sym - FcitxKey_1) < pageSize_)
                     selectCandidate(currentPage() * pageSize_ + int(sym - FcitxKey_1));
@@ -852,8 +886,8 @@ public:
             return;
         }
 
-        // 没有组合时
-        if (sym >= FcitxKey_a && sym <= FcitxKey_z && !shift) {
+        // 没有组合时（CapsLock 开启时 Shift+字母 会产生小写的 a..z 且 shift=true，同样进组合）
+        if (sym >= FcitxKey_a && sym <= FcitxKey_z) {
             keyEvent.filterAndAccept();
             sendContext(ic);            // 新组合开始：先告诉引擎光标前后是什么
             sendLetter(char(sym));
@@ -919,9 +953,16 @@ public:
 
     // 调试日志：存在 $XDG_RUNTIME_DIR/minime-plugin-debug 时打到 fcitx5 的日志（journalctl --user）
     static bool debugOn() {
-        const char *rt = getenv("XDG_RUNTIME_DIR");
-        std::string p = std::string(rt && *rt ? rt : "/tmp") + "/minime-plugin-debug";
-        return access(p.c_str(), F_OK) == 0;
+        static auto last = std::chrono::steady_clock::time_point::min();
+        static bool cached = false;
+        const auto now = std::chrono::steady_clock::now();
+        if (last == std::chrono::steady_clock::time_point::min() || now - last >= std::chrono::seconds(2)) {
+            const char *rt = getenv("XDG_RUNTIME_DIR");
+            std::string p = std::string(rt && *rt ? rt : "/tmp") + "/minime-plugin-debug";
+            cached = access(p.c_str(), F_OK) == 0;
+            last = now;
+        }
+        return cached;
     }
 
     // 供 MinimeCandidateWord::select 调用（鼠标点选）
@@ -972,12 +1013,17 @@ private:
     // 删掉最后一个音节：数预编辑最后一段（引擎用 ' 或空格分音节）里的字母，发同样多个退格
     void deleteSyllable() {
         waitIdle(100);
+        auto isSylChar = [this](char ch) {
+            return std::isalpha(static_cast<unsigned char>(ch)) || (ch == ';' && semicolonIsKey());
+        };
         size_t end = pending_.size();
         while (end > 0 && (pending_[end - 1] == '\'' || pending_[end - 1] == ' ')) end--;
         size_t start = end;
-        while (start > 0 && std::isalpha(static_cast<unsigned char>(pending_[start - 1]))) start--;
-        int n = int(end - start);
-        if (n <= 0) n = 1;                  // 末尾不是字母（已选的汉字等）：退一格
+        while (start > 0 && isSylChar(pending_[start - 1])) start--;
+        // 末尾紧跟用户主动输入的隔音符 ' 时，连同 ' 一起退格删掉
+        size_t tail = pending_.size();
+        while (tail > end && pending_[tail - 1] == ' ') tail--;
+        int n = (start < end) ? int(tail - start) : 1;   // 末尾不是字母（已选的汉字等）：退一格
         for (int i = 0; i < n; i++) sendKey(0, 12);
     }
 
@@ -1055,6 +1101,10 @@ private:
         for (;;) {
             ssize_t n = read(voiceFd_, buf, sizeof(buf));
             if (n > 0) {
+                if (voiceBuf_.size() + size_t(n) > (1u << 20)) {
+                    voiceClose();
+                    return;
+                }
                 voiceBuf_.append(buf, size_t(n));
                 continue;
             }
@@ -1100,7 +1150,16 @@ private:
         if (!ic) return;
         auto &panel = ic->inputPanel();
         panel.reset();
-        panel.setAuxUp(fcitx::Text(voiceStatus_));
+        std::string status = voiceStatus_;
+        if (!voiceStopping_ && voiceStatus_.rfind("🎙 请说话", 0) == 0) {
+            auto sec = int(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - voiceT0_).count());
+            if (sec < 0) sec = 0;
+            char buf[96];
+            snprintf(buf, sizeof(buf), "🎙 请说话（%d:%02d / 5:00，松开或回车结束，Esc 取消）", sec / 60, sec % 60);
+            status = buf;
+        }
+        panel.setAuxUp(fcitx::Text(status));
         if (!voicePartial_.empty()) {
             fcitx::Text text;
             text.append(voicePartial_, fcitx::TextFormatFlags{fcitx::TextFormatFlag::Underline});
@@ -1204,11 +1263,25 @@ private:
     void finishWithPunct(const std::string &p) {
         punctAfter_ += p;
         waitIdle(100);
-        for (int i = 0; i < 16 && isComposing(); i++) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        for (int i = 0; i < 16 && isComposing() && !candidates_.empty(); i++) {
+            int left = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now()).count());
+            if (left <= 0) break;
             const uint64_t seq = candSeq_;
             selectCandidate(focused_);
-            waitUntil([&] { return inflight_ == 0 && (!isComposing() || candSeq_ != seq); }, 300);
+            waitUntil([&] { return inflight_ == 0 && (!isComposing() || candSeq_ != seq); }, left);
             if (isComposing() && candSeq_ == seq) break;    // 没等到新候选：标点等上屏时再出
+        }
+        if (isComposing() && candidates_.empty()) {
+            // 有预编辑却没有候选（如误触字符导致无效组合）：原样上屏并跟上标点，避免吞键或残留 punctAfter_
+            std::string pa = std::move(punctAfter_);
+            punctAfter_.clear();
+            std::string raw = raw_.empty() ? pending_ : raw_;
+            resetEngine();
+            clearState();
+            if (ic_ && !raw.empty()) commit(ic_, raw + pa);
+            else if (ic_ && !pa.empty()) commit(ic_, pa);
         }
         updateUi();
     }
@@ -1232,6 +1305,8 @@ private:
 
     // 让引擎丢掉当前组合。原生服务认 ESC；官方 server 不认（会当成字符插进去），只能断开重连
     void resetEngine() {
+        discarding_ = true;
+        punctAfter_.clear();
         waitIdle(100);
         if (bridge_.connected() && bridge_.native()) {
             sendKey(0, 10);
@@ -1239,13 +1314,14 @@ private:
         } else {
             teardown();             // 下次按键时重连 = 新会话
         }
+        discarding_ = false;
     }
 
     // 处理一帧响应；返回 false 表示不是有意义的帧
     void handleReply(EngineReply &rep) {
         if (rep.type == 1) {
-            if (inflight_ > 0) inflight_--;
-            if (ic_ && !rep.emit.empty()) commit(ic_, rep.emit + punctAfter_);
+            if (!bridge_.native() && inflight_ > 0) inflight_--;   // 原生服务总是在后面附带一帧 RESP_PENDING
+            if (!discarding_ && ic_ && !rep.emit.empty()) commit(ic_, rep.emit + punctAfter_);
             punctAfter_.clear();
             candidates_.clear();
             pending_.clear();
@@ -1267,8 +1343,10 @@ private:
             wantPage_ = -1;
         } else if (rep.type == 3) {
             if (inflight_ > 0) inflight_--;
-            pending_ = std::move(rep.pending);
-            raw_ = std::move(rep.raw);
+            if (!discarding_) {
+                pending_ = std::move(rep.pending);
+                raw_ = std::move(rep.raw);
+            }
         }
     }
 
@@ -1360,8 +1438,7 @@ private:
         } else if (ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText) && sur.isValid()) {
             const std::string &t = sur.text();
             size_t pos = utf8Bytes(t, sur.cursor());
-            before = utf8Tail(t.substr(0, pos), kBeforeChars);
-            after = t.substr(pos, utf8Bytes(t.substr(pos), kAfterChars));
+            after = t.substr(pos, utf8Bytes(t, pos, kAfterChars) - pos);
             before = textBefore(ic, kBeforeChars);   // 补上应用还没反映进来的刚上屏文字
         } else {
             before = textBefore(ic, kBeforeChars);   // 应用不给周围文字：只能用自己上屏过的
@@ -1520,6 +1597,7 @@ private:
             });
         }
         if (bridge_.connected()) sendConfig();
+        updateUi();
     }
 
     void sendConfig() {
@@ -1590,6 +1668,7 @@ private:
     static constexpr size_t kRecentChars = 32, kBeforeChars = 64, kAfterChars = 32;
     int focused_ = 0;
     int inflight_ = 0;         // 已发出、还没收到预编辑/上屏响应的命令数
+    bool discarding_ = false;  // resetEngine 丢弃在途组合期间抑制误上屏
 };
 
 void MinimeCandidateWord::select(fcitx::InputContext *) const { engine_->selectByIndex(index_); }

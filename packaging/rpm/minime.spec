@@ -3,7 +3,7 @@
 # 构建时 cargo 要联网取依赖；Rust 需要较新的 stable（发行版自带的太旧时用 rustup）。
 
 Name:           minime
-Version:        0.1.4
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Native Linux fcitx5 input method running the WeType engine
 License:        MPL-2.0
@@ -64,6 +64,11 @@ MSG
 %{_datadir}/applications/minime-settings.desktop
 
 %changelog
+* Wed Nov 18 2026 MinIME contributors - 0.2.0-1
+- Improve typing responsiveness, voice input (model reuse, 5-minute limit, interruptible recording), and settings UI fluidity
+- Fix PE loader dependency order/resource leaks, e2e long-input & fuzzy pinyin bugs, and netd/settings sync races
+- Harden netd/asrd/scripts boundaries, argument checks, and Debian/Fedora/systemd packaging
+
 * Wed Nov 18 2026 MinIME contributors - 0.1.4-1
 - First-run setup wizard in the settings app: choose files, download with progress, configure
 - minime-fetch --json event stream for the settings app

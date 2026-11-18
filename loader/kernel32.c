@@ -202,6 +202,10 @@ static pthread_mutex_t g_vmem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static WINAPI void *k32_VirtualAlloc(void *addr, SIZE_T n, DWORD type, DWORD prot)
 {
+    if (!n) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
     if (addr && !(type & MEM_RESERVE)) {
         /* 在已保留的区域里提交 */
         if (mprotect((void *)((uintptr_t)addr & ~4095UL), n + ((uintptr_t)addr & 4095), page_prot(prot)) == 0)
@@ -215,14 +219,21 @@ static WINAPI void *k32_VirtualAlloc(void *addr, SIZE_T n, DWORD type, DWORD pro
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    int slot = -1;
     pthread_mutex_lock(&g_vmem_lock);
     for (int i = 0; i < 4096; i++)
         if (!g_vmem[i].p) {
             g_vmem[i].p = p;
             g_vmem[i].n = n;
+            slot = i;
             break;
         }
     pthread_mutex_unlock(&g_vmem_lock);
+    if (slot < 0) {
+        munmap(p, n);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 
@@ -264,36 +275,80 @@ static WINAPI DWORD k32_TlsAlloc(void)
             return (DWORD)i;
     }
 }
-static WINAPI BOOL k32_TlsFree(DWORD i) { atomic_fetch_and(&g_tls_bitmap, ~(1ULL << i)); return TRUE; }
+static WINAPI BOOL k32_TlsFree(DWORD i)
+{
+    if (i >= 64) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    atomic_fetch_and(&g_tls_bitmap, ~(1ULL << i));
+    return TRUE;
+}
 static WINAPI void *k32_TlsGetValue(DWORD i)
 {
+    if (i >= 64) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
     set_last_error(0);
     return ((void **)(cur_teb() + TEB_TLS_SLOTS))[i];
 }
 static WINAPI BOOL k32_TlsSetValue(DWORD i, void *v)
 {
+    if (i >= 64) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     ((void **)(cur_teb() + TEB_TLS_SLOTS))[i] = v;
     return TRUE;
 }
 
 typedef void (WINAPI *FlsCallback)(void *);
 static FlsCallback g_fls_cb[128];
-static atomic_int g_fls_next = 1;   /* 0 号不用，免得和"未分配"混淆 */
+static atomic_uint_least64_t g_fls_bitmap[2] = { 1, 0 }; /* bit 0 保留，避免返回 0 */
 static WINAPI DWORD k32_FlsAlloc(FlsCallback cb)
 {
-    int i = atomic_fetch_add(&g_fls_next, 1);
-    if (i >= 128)
-        return 0xffffffffu;
-    g_fls_cb[i] = cb;
-    return (DWORD)i;
+    for (int w = 0; w < 2; w++) {
+        for (;;) {
+            uint64_t b = atomic_load(&g_fls_bitmap[w]);
+            if (b == UINT64_MAX)
+                break;
+            int bit = __builtin_ctzll(~b);
+            if (atomic_compare_exchange_weak(&g_fls_bitmap[w], &b, b | (1ULL << bit))) {
+                int i = w * 64 + bit;
+                g_fls_cb[i] = cb;
+                return (DWORD)i;
+            }
+        }
+    }
+    set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+    return 0xffffffffu;
 }
-static WINAPI BOOL k32_FlsFree(DWORD i) { if (i < 128) g_fls_cb[i] = NULL; return TRUE; }
+static WINAPI BOOL k32_FlsFree(DWORD i)
+{
+    if (i == 0 || i >= 128) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    g_fls_cb[i] = NULL;
+    atomic_fetch_and(&g_fls_bitmap[i / 64], ~(1ULL << (i % 64)));
+    return TRUE;
+}
 static WINAPI void *k32_FlsGetValue(DWORD i)
 {
+    if (i == 0 || i >= 128) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    set_last_error(0);
     return (*(void ***)(cur_teb() + TEB_FLS_DATA))[i];
 }
 static WINAPI BOOL k32_FlsSetValue(DWORD i, void *v)
 {
+    if (i == 0 || i >= 128) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     (*(void ***)(cur_teb() + TEB_FLS_DATA))[i] = v;
     return TRUE;
 }
@@ -605,6 +660,32 @@ KObj *ko(HANDLE h)
 static __thread KObj *t_self;     /* 当前线程的线程对象（我们建的线程才有） */
 static __thread jmp_buf t_exit_jb;
 
+void ko_unref(KObj *o)
+{
+    if (!o)
+        return;
+    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    o->magic = 0;
+    free(o->path);
+    free(o->pattern);
+    while (o->apcs) {
+        Apc *a = o->apcs;
+        o->apcs = a->next;
+        free(a);
+    }
+    if (o->type == KO_IOCP) {
+        while (o->qhead) {
+            Completion *c = o->qhead;
+            o->qhead = c->next;
+            free(c);
+        }
+        pthread_mutex_destroy(&o->qmu);
+        pthread_cond_destroy(&o->qcv);
+    }
+    free(o);
+}
+
 WINAPI BOOL k32_CloseHandle(HANDLE h)
 {
     KObj *o = ko(h);
@@ -625,7 +706,7 @@ WINAPI BOOL k32_CloseHandle(HANDLE h)
     }
     if (o->type == KO_FIND)
         find_close_obj(o);
-    /* 对象内存不回收：线程对象可能还在运行，句柄数量很少，省掉引用计数的复杂度 */
+    ko_unref(o);
     return TRUE;
 }
 
@@ -975,8 +1056,10 @@ static WINAPI DWORD k32_QueueUserAPC(void (WINAPI *fn)(ULONG_PTR), HANDLE th, UL
     a->fn = fn;
     a->arg = arg;
     pthread_mutex_lock(&g_ko_lock);
-    a->next = o->apcs;
-    o->apcs = a;
+    Apc **tail = &o->apcs;
+    while (*tail)
+        tail = &(*tail)->next;
+    *tail = a;
     pthread_cond_broadcast(&g_ko_cond);
     pthread_mutex_unlock(&g_ko_lock);
     return 1;
@@ -1010,6 +1093,8 @@ static void *thread_trampoline(void *arg)
     o->signaled = 1;
     pthread_cond_broadcast(&g_ko_cond);
     pthread_mutex_unlock(&g_ko_lock);
+    t_self = NULL;
+    ko_unref(o);
     return NULL;
 }
 
@@ -1017,6 +1102,7 @@ static WINAPI HANDLE k32_CreateThread(void *sa, SIZE_T stack, ThreadProc start, 
 {
     (void)sa;
     KObj *o = ko_new(KO_THREAD);
+    o->refs = 2;                    /* 1 份归调用者句柄，1 份归 thread_trampoline */
     o->start = (void *)start;
     o->param = param;
     o->suspended = (flags & CREATE_SUSPENDED) != 0;
@@ -1026,6 +1112,8 @@ static WINAPI HANDLE k32_CreateThread(void *sa, SIZE_T stack, ThreadProc start, 
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&o->th, &a, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&a);
+        o->refs = 1;
+        ko_unref(o);
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -1854,7 +1942,7 @@ static WINAPI BOOL k32_GetLogicalProcessorInformation(uint8_t *buf, DWORD *len)
     }
     memset(buf, 0, need);
     for (DWORD i = 0; i < n; i++) {
-        *(uint64_t *)(buf + i * 32) = 1ULL << i;   /* ProcessorMask */
+        *(uint64_t *)(buf + i * 32) = 1ULL << (i & 63);   /* ProcessorMask */
         *(int32_t *)(buf + i * 32 + 8) = 0;        /* RelationProcessorCore */
     }
     *len = need;
@@ -1882,7 +1970,7 @@ static WINAPI BOOL k32_GetLogicalProcessorInformationEx(int rel, uint8_t *buf, D
             *(int32_t *)p = 0;
             *(DWORD *)(p + 4) = 48;
             *(WORD *)(p + 8 + 22) = 1;            /* GroupCount */
-            *(uint64_t *)(p + 8 + 24) = 1ULL << i;  /* GroupMask[0].Mask */
+            *(uint64_t *)(p + 8 + 24) = 1ULL << (i & 63);  /* GroupMask[0].Mask */
         }
     if (want_pkg) {
         *(int32_t *)p = 3;

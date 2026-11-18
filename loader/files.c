@@ -706,6 +706,7 @@ static WINAPI HANDLE f_FindFirstFileExW(LPCWSTR spec, int level, uint8_t *out, i
     o->pattern = pat;
     if (!find_next(o, out)) {
         find_close_obj(o);
+        ko_unref(o);
         set_last_error(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
@@ -734,6 +735,7 @@ static WINAPI BOOL f_FindClose(HANDLE h)
     if (!o || o->type != KO_FIND)
         return FALSE;
     find_close_obj(o);
+    ko_unref(o);
     return TRUE;
 }
 
@@ -757,6 +759,8 @@ static WINAPI HANDLE f_CreateFileMappingW(HANDLE file, void *sa, DWORD prot, DWO
     if (file == INVALID_HANDLE_VALUE) {
         fd = memfd_create("minime-mapping", MFD_CLOEXEC);
         if (fd < 0 || ftruncate(fd, (off_t)size) != 0) {
+            if (fd >= 0)
+                close(fd);
             set_last_error(ERROR_NOT_ENOUGH_MEMORY);
             return NULL;
         }
@@ -813,14 +817,21 @@ static WINAPI void *f_MapViewOfFile(HANDLE map, DWORD access, DWORD hi, DWORD lo
         fail_errno(NULL);
         return NULL;
     }
+    int slot = -1;
     pthread_mutex_lock(&g_views_lock);
     for (int i = 0; i < 4096; i++)
         if (!g_views[i].p) {
             g_views[i].p = p;
             g_views[i].n = n;
+            slot = i;
             break;
         }
     pthread_mutex_unlock(&g_views_lock);
+    if (slot < 0) {
+        munmap(p, n);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 

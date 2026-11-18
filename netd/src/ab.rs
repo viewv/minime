@@ -20,6 +20,12 @@ pub fn path() -> PathBuf {
 /// 解析 4814/28 的响应：返回 (引擎实验的键值, 客户端实验的键值)。
 pub fn parse(body: &[u8]) -> Result<(Vec<(String, String)>, Vec<(String, String)>), crate::pb::PbError> {
     let m = Msg::parse(body)?;
+    if m.has(1) && m.sub(1)?.int(1) != 0 {
+        return Err(crate::pb::PbError("ab response error status"));
+    }
+    if !m.has(2) {
+        return Err(crate::pb::PbError("missing ab config body"));
+    }
     let inner = m.sub(2)?;
     let mut engine = Vec::new();
     let mut client = Vec::new();

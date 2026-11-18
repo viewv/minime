@@ -357,6 +357,17 @@ void pe_thread_exit_hooks(void)
         if (m->entry_rva)
             ((DllEntry)(m->base + m->entry_rva))(m->base, DLL_THREAD_DETACH, NULL);
     }
+    if (t_teb) {
+        void **tls = *(void ***)(t_teb + TEB_TLS_POINTER);
+        if (tls) {
+            for (int i = 0; i < 64; i++)
+                free(tls[i]);
+            free(tls);
+        }
+        free(*(void **)(t_teb + TEB_FLS_DATA));
+        free(t_teb);
+        t_teb = NULL;
+    }
 }
 
 /* ---------------- 崩溃报告 ---------------- */
@@ -414,6 +425,9 @@ void pe_process_init(void)
     *(uint32_t *)(g_peb + 0x11c) = 0;     /* OSMinorVersion */
     *(uint16_t *)(g_peb + 0x120) = 19045; /* OSBuildNumber */
     *(uint32_t *)(g_peb + 0x124) = 2;     /* OSPlatformId = VER_PLATFORM_WIN32_NT */
+    static uint8_t alt_stack[32768] __attribute__((aligned(16)));
+    stack_t ss = { .ss_sp = alt_stack, .ss_size = sizeof(alt_stack), .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
@@ -426,9 +440,14 @@ void pe_process_init(void)
 }
 
 /* ---------------- 装载 ---------------- */
-static pe_module *load_one(const char *path);
+typedef struct {
+    pe_module *mods[128];
+    int count;
+} InitList;
 
-static int bind_imports(pe_module *m, OptHeader64 *oh)
+static pe_module *load_one(const char *path, InitList *init);
+
+static int bind_imports(pe_module *m, OptHeader64 *oh, InitList *init)
 {
     DataDir d = oh->Dir[DIR_IMPORT];
     if (!d.VirtualAddress)
@@ -451,7 +470,7 @@ static int bind_imports(pe_module *m, OptHeader64 *oh)
             if (!dep) {
                 char p[1024];
                 snprintf(p, sizeof(p), "%s/%s", dir, dll);
-                dep = load_one(p);
+                dep = load_one(p, init);
                 if (!dep) {
                     fprintf(stderr, "[loader] %s 依赖的 %s 装载失败\n", m->name, dll);
                     return -1;
@@ -474,7 +493,7 @@ static int bind_imports(pe_module *m, OptHeader64 *oh)
                 const char *label = (uintptr_t)fn < 0x10000 ? ordname : fn;
                 if (!sys)
                     fprintf(stderr, "[loader] %s 从 %s 导入的 %s 找不到\n", m->name, dll, label);
-                addr = make_unknown_thunk(dll, strdup(label));
+                addr = make_unknown_thunk(dll, label);
                 unknown++;
             }
             *iat = (uint64_t)(uintptr_t)addr;
@@ -482,6 +501,33 @@ static int bind_imports(pe_module *m, OptHeader64 *oh)
     }
     LOG("%s: 导入绑定完成，%d 个未实现（调用时报告）\n", m->name, unknown);
     return 0;
+}
+
+/* 把模块 m 从 dll 导入的 fn 换成 newfn（调试用：替换引擎从某个 DLL 导入的函数）。
+ * 返回原来的地址，没找到返回 NULL。 */
+void *pe_patch_import(pe_module *m, const char *dll, const char *fn, void *newfn)
+{
+    FileHeader *fh = (FileHeader *)(m->base + ((DosHeader *)m->base)->e_lfanew);
+    OptHeader64 *oh = (OptHeader64 *)(fh + 1);
+    DataDir d = oh->Dir[DIR_IMPORT];
+    if (!d.VirtualAddress)
+        return NULL;
+    for (ImportDesc *id = (ImportDesc *)(m->base + d.VirtualAddress); id->Name; id++) {
+        if (strcasecmp((const char *)(m->base + id->Name), dll) != 0)
+            continue;
+        uint64_t *names = (uint64_t *)(m->base + (id->OriginalFirstThunk ? id->OriginalFirstThunk : id->FirstThunk));
+        uint64_t *iat = (uint64_t *)(m->base + id->FirstThunk);
+        for (; *names; names++, iat++) {
+            if (*names & (1ULL << 63) || strcmp((const char *)(m->base + (uint32_t)*names + 2), fn) != 0)
+                continue;
+            void *old = (void *)(uintptr_t)*iat;
+            uintptr_t pg = (uintptr_t)iat & ~(uintptr_t)4095;
+            mprotect((void *)pg, 4096, PROT_READ | PROT_WRITE);
+            *iat = (uint64_t)(uintptr_t)newfn;
+            return old;
+        }
+    }
+    return NULL;
 }
 
 /* ---------------- 映像缓存 ----------------
@@ -590,7 +636,19 @@ static int save_cache(const char *cpath, const uint8_t *base, size_t size)
     return 1;
 }
 
-static pe_module *load_one(const char *path)
+static void unlink_module(pe_module *m)
+{
+    pe_module **pp = &g_modules;
+    while (*pp) {
+        if (*pp == m) {
+            *pp = m->next;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static pe_module *load_one(const char *path, InitList *init)
 {
     pe_module *exist = pe_module_by_name(path);
     if (exist)
@@ -601,16 +659,25 @@ static pe_module *load_one(const char *path)
         return NULL;
     }
     struct stat st;
-    fstat(fd, &st);
-    uint8_t *file = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)(sizeof(DosHeader) + sizeof(FileHeader))) {
+        close(fd);
+        return NULL;
+    }
+    uint8_t *file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (file == MAP_FAILED)
         return NULL;
     DosHeader *dos = (DosHeader *)file;
+    if (dos->e_magic != 0x5a4d || dos->e_lfanew < 0 ||
+        (off_t)dos->e_lfanew + (off_t)sizeof(FileHeader) > st.st_size) {
+        fprintf(stderr, "[loader] %s 不是有效的 x64 PE\n", path);
+        munmap(file, (size_t)st.st_size);
+        return NULL;
+    }
     FileHeader *fh = (FileHeader *)(file + dos->e_lfanew);
-    if (dos->e_magic != 0x5a4d || fh->Signature != 0x4550 || fh->Machine != 0x8664) {
+    if (fh->Signature != 0x4550 || fh->Machine != 0x8664) {
         fprintf(stderr, "[loader] %s 不是 x64 PE\n", path);
-        munmap(file, st.st_size);
+        munmap(file, (size_t)st.st_size);
         return NULL;
     }
     OptHeader64 *oh = (OptHeader64 *)(fh + 1);
@@ -673,6 +740,7 @@ static pe_module *load_one(const char *path)
                     *(uint64_t *)(base + page + (*e & 0xfff)) += delta;
                 else if (type != 0) {
                     fprintf(stderr, "[loader] %s 有不支持的重定位类型 %d\n", path, type);
+                    munmap(base, oh->SizeOfImage);
                     return NULL;
                 }
             }
@@ -699,18 +767,25 @@ static pe_module *load_one(const char *path)
     LOG("%s 映射在 %p（%s首选基址，%s），大小 %#zx\n", m->name, base, delta ? "非" : "",
         cached ? "按文件映射" : "复制进内存", m->size);
 
-    if (bind_imports(m, oh) < 0)
+    if (bind_imports(m, oh, init) < 0) {
+        unlink_module(m);
+        munmap(m->base, m->size);
+        free(m);
         return NULL;
+    }
 
     /* 静态 TLS：给模块分配索引，写回模块里的索引变量 */
-    if (oh->Dir[DIR_TLS].VirtualAddress) {
+    if (oh->Dir[DIR_TLS].VirtualAddress &&
+        (uint64_t)oh->Dir[DIR_TLS].VirtualAddress + sizeof(TlsDir) <= m->size) {
         TlsDir *td = (TlsDir *)(base + oh->Dir[DIR_TLS].VirtualAddress);
         m->tls_index = g_tls_count++;
         m->tls_template = (uint8_t *)(uintptr_t)td->StartAddressOfRawData;
         m->tls_template_size = td->EndAddressOfRawData - td->StartAddressOfRawData;
         m->tls_zero_fill = td->SizeOfZeroFill;
         m->tls_callbacks = (uint64_t *)(uintptr_t)td->AddressOfCallBacks;
-        *(uint32_t *)(uintptr_t)td->AddressOfIndex = (uint32_t)m->tls_index;
+        if (td->AddressOfIndex >= (uint64_t)(uintptr_t)base &&
+            td->AddressOfIndex + sizeof(uint32_t) <= (uint64_t)(uintptr_t)(base + m->size))
+            *(uint32_t *)(uintptr_t)td->AddressOfIndex = (uint32_t)m->tls_index;
         LOG("%s: TLS 索引 %d，模板 %zu 字节\n", m->name, m->tls_index, m->tls_template_size);
     }
 
@@ -726,6 +801,8 @@ static pe_module *load_one(const char *path)
             fprintf(stderr, "[loader] mprotect %s 失败\n", sec[i].Name);
     }
     mprotect(base, 4096, PROT_READ);
+    if (init && init->count < (int)(sizeof(init->mods) / sizeof(init->mods[0])))
+        init->mods[init->count++] = m;
     return m;
 }
 
@@ -749,15 +826,14 @@ pe_module *pe_load(const char *path)
 {
     pe_process_init();
     pthread_mutex_lock(&g_load_lock);
-    pe_module *before = g_modules;
-    pe_module *m = load_one(path);
+    InitList init = { .count = 0 };
+    pe_module *m = load_one(path, &init);
     pthread_mutex_unlock(&g_load_lock);
     if (!m)
         return NULL;
-    /* 依赖先初始化。模块在绑定导入之前就挂到链表头，它的依赖随后装载、挂在更靠前的位置，
-     * 所以从链表头往后走就是"依赖在前"的顺序。 */
-    for (pe_module *p = g_modules; p != before; p = p->next)
-        if (init_module(p) < 0)
+    /* 后序装载：依赖在 bind_imports 完成后先入队，正序遍历即为拓扑依赖序。 */
+    for (int i = 0; i < init.count; i++)
+        if (init_module(init.mods[i]) < 0)
             return NULL;
     return m;
 }

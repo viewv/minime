@@ -46,6 +46,7 @@ typedef struct KObj {
 
 KObj *ko_new(int type);
 KObj *ko(HANDLE h);
+void ko_unref(KObj *o);
 WINAPI BOOL k32_CloseHandle(HANDLE h);
 void find_close_obj(KObj *o);
 

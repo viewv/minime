@@ -35,8 +35,8 @@ Version: $VERSION-$REL
 Architecture: $ARCH
 Maintainer: MinIME contributors
 Installed-Size: $SIZE
-Depends: $SHLIBS, libvulkan1, libwayland-client0, libfontconfig1, fcitx5, python3, 7zip | p7zip-full, curl
-Recommends: fcitx5-config-qt, fcitx5-frontend-qt6, fcitx5-frontend-gtk3, fcitx5-frontend-gtk4, wl-clipboard, pipewire-bin | pulseaudio-utils, mesa-vulkan-drivers
+Depends: ${SHLIBS:+$SHLIBS, }libvulkan1, libwayland-client0, libfontconfig1, fcitx5, python3, 7zip | p7zip-full, curl
+Recommends: fcitx5-config-qt, fcitx5-frontend-qt6, fcitx5-frontend-gtk3, fcitx5-frontend-gtk4, wl-clipboard, pipewire-bin | pulseaudio-utils, mesa-vulkan-drivers, libopencc1.1 | libopencc1
 Section: utils
 Priority: optional
 Homepage: https://github.com/viewv/minime

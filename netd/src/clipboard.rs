@@ -85,6 +85,13 @@ pub async fn read(want_image: bool) -> Content {
         return Content::Skip("not text");
     };
     let Some(data) = run(&["--no-newline", "--type", mime]).await else { return Content::Skip("read failed") };
+    // 二次校验：防止 --list-types 与实际读取之间切进了密码管理器内容（TOCTOU）
+    if let Some(after) = run(&["--list-types"]).await {
+        let after = String::from_utf8_lossy(&after);
+        if after.lines().any(|t| t.trim() == SECRET_HINT) {
+            return Content::Skip("password manager");
+        }
+    }
     if data.is_empty() {
         return Content::Skip("empty");
     }
@@ -118,13 +125,18 @@ async fn copy(mime: &str, data: &[u8]) -> std::io::Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(data).await?;
     }
     // wl-copy 读完输入就 fork 到后台持有剪贴板，前台进程马上退出
-    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-    Ok(())
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(std::io::Error::other(format!("wl-copy exited with {status}"))),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "wl-copy timeout")),
+    }
 }
 
 pub async fn write_image(mime: &str, data: &[u8]) -> std::io::Result<()> {

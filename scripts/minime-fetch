@@ -309,10 +309,13 @@ def voice_ok():
 
 def fetch_voice(force=False):
     stage("voice", "download")
+    model_dir = os.path.join(data_home(), "minime", "asr", "model")
     if voice_ok() and not force:
         stage("voice", "skip")
         say("语音模型：已安装")
         return
+    if force and os.path.isdir(model_dir):
+        shutil.rmtree(model_dir, ignore_errors=True)
     b = asrd_bin() or die("没有找到 minime-asrd（离线语音组件没有安装）")
     say("下载语音模型（约 100 MB）")
     if not JSON:
@@ -346,10 +349,14 @@ def fetch_voice(force=False):
     bar = None
     while p.poll() is None:
         time.sleep(0.25)
-        if total[0] and os.path.exists(apk):
+        if total[0]:
+            try:
+                sz = os.path.getsize(apk)
+            except OSError:
+                continue
             if bar is None:
                 bar = Progress(total[0])
-            bar.add(os.path.getsize(apk) - bar.done)
+            bar.add(sz - bar.done)
     t.join(2)
     if p.returncode != 0:
         die("语音模型下载失败")
@@ -465,11 +472,15 @@ def main(argv):
         src = argv[i + 1] if i + 1 < len(argv) else die("--from 后面要跟安装包路径")
         argv = argv[:i] + argv[i + 2:]
     no_setup = "--no-setup" in argv
-    what = [a for a in argv if not a.startswith("--")] or ["engine", "e2e"]
+    known_flags = {"-h", "--help", "--json", "--force", "--no-setup", "--from"}
+    for a in argv:
+        if a.startswith("-") and a not in known_flags:
+            die("不认识的选项：%s（minime-fetch --help）" % a)
+    what = [a for a in argv if not a.startswith("-")] or ["engine", "e2e"]
     if what == ["status"]:
         return status()
     if what == ["setup"]:
-        return setup()
+        return setup(voice=voice_ok(), engine=True)
     if "all" in what:
         what = ["engine", "e2e", "voice"]
     for w in what:
@@ -481,7 +492,12 @@ def main(argv):
             fetch_voice(force)
         else:
             die("不认识的参数：%s（minime-fetch --help）" % w)
-    if no_setup or not engine_ok():
+    if no_setup:
+        say("完成。")
+        return 0
+    if not engine_ok():
+        if "voice" in what:
+            setup_voice()
         say("完成。")
         return 0
     say("下载完成，接着配置：")
