@@ -157,7 +157,7 @@ static void *make_unknown_thunk(const char *dll, const char *name)
     return ret;
 }
 
-WINAPI void unknown_import_log(const char *label)
+__attribute__((used)) WINAPI void unknown_import_log(const char *label)
 {
     /* 同一个函数只报一次，避免刷屏 */
     static const char *seen[512];

@@ -15,22 +15,36 @@
 set -e
 R=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$R/asrd/target/release/minime-asrd
-UNIT=$HOME/.config/systemd/user/minime-asrd.service
-SOCK=$HOME/.config/systemd/user/minime-asrd.socket
+CFG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+UNIT=$CFG_HOME/systemd/user/minime-asrd.service
+SOCK=$CFG_HOME/systemd/user/minime-asrd.socket
 
 (cd "$R/asrd" && cargo build --release)
 "$BIN" fetch-model
 mkdir -p "$(dirname "$UNIT")"
 # 单元文件直接用软件包里的那两份，只换程序路径：本机和用户装完的一样
-sed "s|^ExecStart=/usr/bin/minime-asrd\$|ExecStart=$BIN|" "$R/packaging/systemd/minime-asrd.service" > "$UNIT"
+python3 -I - "$R/packaging/systemd/minime-asrd.service" "$UNIT" "$BIN" <<'PY'
+import sys
+
+def sd_quote(arg):
+    if any(ch.isspace() or ch in '"\\\'' for ch in arg):
+        return '"' + arg.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return arg
+
+src, dst, bin_path = sys.argv[1:4]
+s = open(src, encoding="utf-8").read()
+assert "ExecStart=/usr/bin/minime-asrd" in s
+s = s.replace("ExecStart=/usr/bin/minime-asrd", "ExecStart=" + sd_quote(bin_path), 1)
+open(dst, "w", encoding="utf-8").write(s)
+PY
 cp "$R/packaging/systemd/minime-asrd.socket" "$SOCK"
 # 早先的版本把服务设成了登录自启：改成按需启动
 systemctl --user disable minime-asrd.service 2>/dev/null || true
 # 改名前（wetype）的服务：停掉、取消自启、删掉单元文件
 for u in wetype-asrd.socket wetype-asrd.service; do
-  if [ -e "$HOME/.config/systemd/user/$u" ]; then
+  if [ -e "$CFG_HOME/systemd/user/$u" ]; then
     systemctl --user disable --now "$u" 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/$u"
+    rm -f "$CFG_HOME/systemd/user/$u"
     echo "已移除旧服务 $u"
   fi
 done

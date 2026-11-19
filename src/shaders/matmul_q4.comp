@@ -1,33 +1,52 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
+#ifdef USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#else
 #extension GL_KHR_shader_subgroup_clustered : require
+#endif
 #include "common.glsl"
 // Y[b][r] (+)= sum_c W[r][c] X[b][c] + bias[r]，W 是 int4：数据 [R/8][C/2][8] 字节（高 4 位第 2c 列，
 // 低 4 位第 2c+1 列），scale fp16 [R/8][C/32][8]，值 = (q-8)*scale。
 //
-// CL 个 32 线程簇分列算一个 8 行块，一个工作组 RB 个块；每个线程一次读 16 字节 = 4 列 × 8 行。
+// 整个工作组算一个 8 行块，wg 个线程分列来算；每个线程一次读 16 字节 = 4 列 × 8 行。
 // 一个工作组算 NB 个 token（特化常量，循环全部展开，累加器留在寄存器里）。
-// (q-8)·x = q·x - 8·Σx，减 8 挪到列和上做。最后簇内归约（subgroupClusteredAdd，32 宽），簇间在共享内存里相加。
+// (q-8)·x = q·x - 8·Σx，减 8 挪到列和上做。
+// 默认变体使用 32 宽簇内归约（subgroupClusteredAdd）；-DUSE_SUBGROUP_ADD 使用通用子组归约以兼容可变 SIMD 宽度。
 // mode：0 写入，1 累加到 Y（残差），2 写入 GELU 后的值，3 写入并把后两段（K、V）存进这一层的 KV 槽位
 layout(constant_id = 0) const uint NB = 4u;
-layout(constant_id = 1) const uint RB = 2u;      // 一个工作组几个 8 行块
-layout(constant_id = 3) const uint CL = 1u;      // 一个块由几个 32 线程簇分列来算（>1 时在共享内存里合并）
-layout(local_size_x_id = 2) in;                  // = 32 * RB * CL
-shared float red[RB * CL * NB * 8u];
+#ifdef USE_SUBGROUP_ADD
+layout(constant_id = 1) const uint MAX_SG = 2u;    // 共享内存预留的最大子组数（>= ceil(wg / minSubgroupSize)）
+layout(local_size_x_id = 2) in;                    // 工作组大小（默认 64）
+shared float red[MAX_SG * NB * 8u];
+#else
+layout(constant_id = 1) const uint CL = 2u;        // 一个 8 行块由几个 32 线程簇分列算
+layout(local_size_x_id = 2) in;                    // = 32 * CL（默认 64）
+shared float red[CL * NB * 8u];
+#endif
 layout(push_constant) uniform P { uint R, C, q, s, bias, xoff, yoff, B, mode, l; } pc;  // q、s：uint 下标（16 字节对齐）；bias：fp16 下标（0xffffffff 没有）
 
 float gelu(float x) { return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))); }
 
 void main() {
-    uint lane = gl_LocalInvocationID.x & 31u, cl = (gl_LocalInvocationID.x >> 5) % CL, rb = gl_LocalInvocationID.x / (32u * CL);
-    uint blk = gl_WorkGroupID.x * RB + rb, lane0 = cl * 32u + lane;
+    uint tid = gl_LocalInvocationID.x;
+#ifdef USE_SUBGROUP_ADD
+    uint wg = gl_WorkGroupSize.x;
+#else
+    uint lane = tid & 31u, cl = tid >> 5;
+#endif
+    uint blk = gl_WorkGroupID.x;
     uint b0 = gl_WorkGroupID.y * NB;
     uint C4 = pc.C >> 2, G = pc.C >> 5;
-    bool live = blk * 8u < pc.R;                 // 整簇一起判断，不影响簇内归约
+    bool live = blk * 8u < pc.R;
     uint qb = (pc.q >> 2) + blk * C4, sb = (pc.s >> 2) + blk * G;
     float acc[NB * 8u];
     for (uint i = 0u; i < NB * 8u; i++) acc[i] = 0.0;
-    for (uint k = lane0; live && k < C4; k += 32u * CL) {
+#ifdef USE_SUBGROUP_ADD
+    for (uint k = tid; live && k < C4; k += wg) {
+#else
+    for (uint k = tid; live && k < C4; k += 32u * CL) {
+#endif
         uvec4 q = w4[qb + k];
         uvec4 sv = w4[sb + (k >> 3)];
         vec4 xs[NB];                              // 先把这几列的输入全读进来，让读取并行发出
@@ -44,14 +63,25 @@ void main() {
             for (uint bb = 0u; bb < NB; bb++) acc[bb * 8u + j] += sc[j] * (dot(wq, xs[bb]) - sx[bb]);
         }
     }
+#ifdef USE_SUBGROUP_ADD
     for (uint i = 0u; i < NB * 8u; i++) {
-        float v = subgroupClusteredAdd(acc[i], 32u);
-        if (lane == (i & 31u)) red[(rb * CL + cl) * NB * 8u + i] = v;
+        float v = subgroupAdd(acc[i]);
+        if (subgroupElect()) red[gl_SubgroupID * NB * 8u + i] = v;
     }
     barrier();
-    for (uint o = gl_LocalInvocationID.x % (32u * CL); live && o < NB * 8u; o += 32u * CL) {   // 块内线程合并各簇
+    for (uint o = tid; live && o < NB * 8u; o += wg) {
         float v = 0.0;
-        for (uint c = 0u; c < CL; c++) v += red[(rb * CL + c) * NB * 8u + o];
+        for (uint s = 0u; s < gl_NumSubgroups; s++) v += red[s * NB * 8u + o];
+#else
+    for (uint i = 0u; i < NB * 8u; i++) {
+        float v = subgroupClusteredAdd(acc[i], 32u);
+        if (lane == (i & 31u)) red[cl * NB * 8u + i] = v;
+    }
+    barrier();
+    for (uint o = tid; live && o < NB * 8u; o += 32u * CL) {
+        float v = 0.0;
+        for (uint c = 0u; c < CL; c++) v += red[c * NB * 8u + o];
+#endif
         uint bb = o >> 3, row = blk * 8u + (o & 7u);
         if (b0 + bb >= pc.B) continue;
         if (pc.bias != 0xffffffffu) v += wHalf(pc.bias + row);

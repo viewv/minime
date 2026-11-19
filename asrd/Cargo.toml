@@ -1,6 +1,6 @@
 [package]
 name = "minime-asrd"
-version = "0.2.0"
+version = "0.2.1"
 license = "MPL-2.0"
 edition = "2021"
 description = "MinIME 离线语音服务：按住说话，本地识别（模型来自官方语音包，不随仓库分发）"

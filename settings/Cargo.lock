@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "minime-netd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "minime-settings"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "gpui-kit",
  "minime-netd",

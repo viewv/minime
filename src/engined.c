@@ -1257,10 +1257,47 @@ static void *e2e_main(void *arg)
 
         double t0 = plat_now_us();
         E2EResult r[1];
-        int n = e2e_decode(g_e2e, ctx, letters, g_e2e_beam, g_e2e_ms, &g_job.cancel, r, 1);
+        /* 自动 LRU 缓存（256 槽 × ~650 B ≈ 166 KB 固定内存，满时自动淘汰最久未用槽位） */
+        enum { E2E_CACHE_CAP = 256 };
+        typedef struct {
+            uint64_t stamp;
+            uint32_t fuzzy;
+            char ctx[sizeof(ctx)];
+            char letters[sizeof(letters)];
+            E2EResult res;
+        } E2ECacheEntry;
+        static E2ECacheEntry cache[E2E_CACHE_CAP];
+        static uint64_t cache_seq = 0;
+        int hit = 0, n = 0;
+        for (int i = 0; i < E2E_CACHE_CAP; i++) {
+            if (cache[i].stamp && cache[i].fuzzy == fuzzy &&
+                !strcmp(cache[i].letters, letters) && !strcmp(cache[i].ctx, ctx)) {
+                cache[i].stamp = ++cache_seq;
+                r[0] = cache[i].res;
+                n = 1;
+                hit = 1;
+                break;
+            }
+        }
+        if (!hit) {
+            n = e2e_decode(g_e2e, ctx, letters, g_e2e_beam, g_e2e_ms, &g_job.cancel, r, 1);
+            if (n > 0 && r[0].text[0]) {
+                int slot = 0;
+                for (int i = 1; i < E2E_CACHE_CAP; i++) {
+                    if (cache[i].stamp < cache[slot].stamp)
+                        slot = i;
+                }
+                cache[slot].stamp = ++cache_seq;
+                cache[slot].fuzzy = fuzzy;
+                snprintf(cache[slot].ctx, sizeof(cache[slot].ctx), "%s", ctx);
+                snprintf(cache[slot].letters, sizeof(cache[slot].letters), "%s", letters);
+                cache[slot].res = r[0];
+            }
+        }
         if (g_debug)
-            fprintf(stderr, "[engined] #%d e2e [%s] \"%s\" -> %s（%.0f ms）\n", c->id, ctx, letters,
-                    n > 0 ? r[0].text : (n < 0 ? "（取消）" : "（无）"), (plat_now_us() - t0) / 1000);
+            fprintf(stderr, "[engined] #%d e2e [%s] \"%s\" -> %s（%.2f ms%s）\n", c->id, ctx, letters,
+                    n > 0 ? r[0].text : (n < 0 ? "（取消）" : "（无）"), (plat_now_us() - t0) / 1000,
+                    hit ? "，LRU 命中" : "");
         if (n <= 0)
             continue;
         /* 放第几位：整句概率够高（短输入、靠上下文分辨的词），或者模型认为它比引擎首选好得多

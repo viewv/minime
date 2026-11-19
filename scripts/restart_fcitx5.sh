@@ -12,24 +12,24 @@
 # 只改了配置、没改插件代码时，用 fcitx5-remote -r 就够了（它不会重新加载插件）。
 set -u
 
-if [ "${XDG_SESSION_TYPE:-}" != wayland ] || ! pgrep -f fcitx5-wayland-launcher >/dev/null; then
+if [ "${XDG_SESSION_TYPE:-}" != wayland ] || ! pgrep -u "$USER" -f '(^|/)fcitx5-wayland-launcher($|[[:space:]])' >/dev/null; then
     echo "没找到 fcitx5-wayland-launcher（不是 KDE Wayland 会话，或输入法不是由 KWin 启动的）；不处理" >&2
     exit 1
 fi
 
-old=$(pgrep -x fcitx5 | head -1)
+old=$(pgrep -u "$USER" -x fcitx5 | head -1)
 fcitx5-remote -e 2>/dev/null || true
 for _ in $(seq 20); do                       # 等旧进程退出（最多 2 秒）
     [ -n "$old" ] && kill -0 "$old" 2>/dev/null || break
     sleep 0.1
 done
-pkill -KILL -f fcitx5-wayland-launcher
+pkill -KILL -u "$USER" -f '(^|/)fcitx5-wayland-launcher($|[[:space:]])'
 
 # KWin 不是立即重启崩溃的输入法：实测（Plasma 6.8）约 15 秒后才重新拉起 launcher
 echo "等 KWin 重新拉起输入法（实测约 15 秒）…"
 start=$(date +%s)
 for _ in $(seq 300); do                      # 最多 30 秒
-    new=$(pgrep -x fcitx5 | grep -vx "${old:-0}" | head -1)
+    new=$(pgrep -u "$USER" -x fcitx5 | grep -vx "${old:-0}" | head -1)
     if [ -n "$new" ]; then
         echo "fcitx5 已重启（进程 $new，等了 $(( $(date +%s) - start )) 秒）"
         exit 0

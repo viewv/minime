@@ -15,7 +15,9 @@
 set -e
 R=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$R/build/native/engined
-UNIT=$HOME/.config/systemd/user/minime-engined.service
+CFG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+UNIT=$CFG_HOME/systemd/user/minime-engined.service
 
 [ -x "$BIN" ] || make -C "$R/src" native
 # 改名前（wetype）的服务先全停掉，免得它们在迁移后又往旧目录里写
@@ -24,38 +26,54 @@ for u in wetype-engined.service wetype-netd.service wetype-asrd.socket wetype-as
 done
 mkdir -p "$(dirname "$UNIT")"
 
-ARGS=""
-E2E_ENV=""
+ENGINE=""
+USERDATA=""
+E2E_DIR=""
 if [ -n "${1:-}" ]; then
   ENGINE=$(realpath "$1")
   [ -f "$ENGINE/libwxhld.dll" ] || { echo "找不到 $ENGINE/libwxhld.dll" >&2; exit 1; }
-  ARGS=" $ENGINE ${XDG_DATA_HOME:-$HOME/.local/share}/minime/userdata"
+  USERDATA="$DATA_HOME/minime/userdata"
   E2E_DIR=${E2E_DIR:-}
   if [ -z "$E2E_DIR" ]; then
     for d in "$ENGINE/BuildIn" "$R/vendor/mac/imeData"; do
       [ -f "$d/decgnr.bin" ] && [ -f "$d/mpd_e2e.bin" ] && { E2E_DIR=$(realpath "$d"); break; }
     done
   fi
-  [ -n "$E2E_DIR" ] && E2E_ENV="Environment=MINIME_E2E_DIR=$E2E_DIR"
   echo "实验配置：引擎 $ENGINE${E2E_DIR:+，整句模型 $E2E_DIR}"
 else
-  OFF=${XDG_DATA_HOME:-$HOME/.local/share}/minime/official
+  OFF="$DATA_HOME/minime/official"
   [ -f "$OFF/win/3.0.1.35/libwxhld.dll" ] || echo "提示：还没有下载官方引擎（$OFF），先运行 scripts/minime-fetch 或在设置程序里下载"
 fi
 
 # 单元文件直接用软件包里的那份，只换程序路径（实验配置再加参数和整句模型目录）
-python3 -c '
+python3 -I - "$R/packaging/systemd/minime-engined.service" "$UNIT" "$BIN" "$ENGINE" "$USERDATA" "$E2E_DIR" <<'PY'
 import sys
-s = open(sys.argv[1]).read()
-s = s.replace("ExecStart=/usr/bin/minime-engined", "ExecStart=" + sys.argv[2] + (("\n" + sys.argv[3]) if sys.argv[3] else ""))
-open(sys.argv[4], "w").write(s)
-' "$R/packaging/systemd/minime-engined.service" "$BIN$ARGS" "$E2E_ENV" "$UNIT"
+
+def sd_quote(arg):
+    if any(ch.isspace() or ch in '"\\\'' for ch in arg):
+        return '"' + arg.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return arg
+
+src, dst, bin_path, engine, userdata, e2e_dir = sys.argv[1:7]
+args = [bin_path] + ([engine, userdata] if engine else [])
+line = "ExecStart=" + " ".join(sd_quote(a) for a in args)
+if e2e_dir:
+    kv = "MINIME_E2E_DIR=" + e2e_dir
+    if any(ch.isspace() or ch in '"\\\'' for ch in e2e_dir):
+        kv = '"' + kv.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    line += "\nEnvironment=" + kv
+
+s = open(src, encoding="utf-8").read()
+assert "ExecStart=/usr/bin/minime-engined" in s
+s = s.replace("ExecStart=/usr/bin/minime-engined", line, 1)
+open(dst, "w", encoding="utf-8").write(s)
+PY
 
 # 改名前（wetype）的服务：停掉、取消自启、删掉单元文件
 for u in wetype-engined.service; do
-  if [ -e "$HOME/.config/systemd/user/$u" ]; then
+  if [ -e "$CFG_HOME/systemd/user/$u" ]; then
     systemctl --user disable --now "$u" 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/$u"
+    rm -f "$CFG_HOME/systemd/user/$u"
     echo "已移除旧服务 $u"
   fi
 done

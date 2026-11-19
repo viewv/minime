@@ -997,6 +997,7 @@ public:
             return;
         }
         focused_ = std::clamp(page * pageSize_, 0, int(candidates_.size()) - 1);
+        focusMovedOnCurrent_ = (inflight_ == 0 && focused_ > 0);
         const int pages = (int(candidates_.size()) + pageSize_ - 1) / pageSize_;
         if (hasMore_ && page >= pages - 2) requestMore(-1);
     }
@@ -1234,6 +1235,7 @@ private:
         raw_.clear();
         punctAfter_.clear();
         focused_ = 0;
+        focusMovedOnCurrent_ = false;
         inflight_ = 0;
         hasMore_ = false;
         moreInflight_ = false;
@@ -1327,17 +1329,36 @@ private:
             pending_.clear();
             raw_.clear();
             focused_ = 0;
+            focusMovedOnCurrent_ = false;
         } else if (rep.type == 2) {
             candSeq_++;
             const bool extended = moreInflight_ && rep.candidates.size() > candidates_.size();
+            const int prevFocused = focused_;
+            const std::string prevText =
+                (!extended && focusMovedOnCurrent_ && inflight_ == 0 &&
+                 prevFocused > 0 && prevFocused < int(candidates_.size()))
+                ? candidates_[prevFocused].value : std::string{};
             candidates_ = std::move(rep.candidates);
             hasMore_ = rep.hasMore;
             if (extended) {
                 // "要更多候选"的回复：保持当前位置；翻页时已经超出末尾的，现在翻过去
                 if (wantPage_ >= 0)
                     focused_ = std::min(wantPage_ * pageSize_, int(candidates_.size()) - 1);
+                focusMovedOnCurrent_ = (focused_ > 0);
+            } else if (!prevText.empty()) {
+                // 同一组合下异步（e2e/云输入）重发候选：保持用户已移走的高亮词，不跳回第 0 项
+                int found = -1;
+                for (int i = 0; i < int(candidates_.size()); i++) {
+                    if (candidates_[i].value == prevText) {
+                        found = i;
+                        break;
+                    }
+                }
+                focused_ = found >= 0 ? found : std::clamp(prevFocused, 0, std::max(0, int(candidates_.size()) - 1));
+                focusMovedOnCurrent_ = (focused_ > 0);
             } else {
                 focused_ = (rep.focused >= 0 && rep.focused < int(candidates_.size())) ? rep.focused : 0;
+                focusMovedOnCurrent_ = false;
             }
             moreInflight_ = false;
             wantPage_ = -1;
@@ -1494,6 +1515,7 @@ private:
         if (d > 0 && hasMore_ && focused_ + d >= int(candidates_.size()) - pageSize_)
             requestMore(-1);            // 光标快到末尾：提前要下一批
         focused_ = std::clamp(focused_ + d, 0, int(candidates_.size()) - 1);
+        focusMovedOnCurrent_ = (inflight_ == 0 && focused_ > 0);
         updateUi();
     }
 
@@ -1507,6 +1529,7 @@ private:
         }
         const int page = std::clamp(target, 0, pages - 1);
         focused_ = std::min(page * pageSize_, int(candidates_.size()) - 1);
+        focusMovedOnCurrent_ = (inflight_ == 0 && focused_ > 0);
         if (d > 0 && hasMore_ && page >= pages - 2)
             requestMore(-1);            // 快到末尾：提前要下一批
         updateUi();
@@ -1630,8 +1653,11 @@ private:
         std::string v1;
         putBytesField(v1, 1, det);
         putBytesField(v1, 2, bridge_.appInfo());
-        if (bridge_.send(v1)) inflight_++;   // 每个键都会回一帧预编辑
-        else teardown();
+        if (bridge_.send(v1)) {
+            inflight_++;   // 每个键都会回一帧预编辑
+            focused_ = 0;
+            focusMovedOnCurrent_ = false;
+        } else teardown();
     }
 
     void selectCandidate(int index) {
@@ -1647,8 +1673,11 @@ private:
         std::string v1;
         putBytesField(v1, 1, det);
         putBytesField(v1, 2, bridge_.appInfo());
-        if (bridge_.send(v1)) inflight_++;   // 回上屏（整词）或新的预编辑（部分选词）
-        else teardown();
+        if (bridge_.send(v1)) {
+            inflight_++;   // 回上屏（整词）或新的预编辑（部分选词）
+            focused_ = 0;
+            focusMovedOnCurrent_ = false;
+        } else teardown();
     }
 
     fcitx::Instance *instance_;
@@ -1667,6 +1696,7 @@ private:
     fcitx::FactoryFor<MinimeIcState> icState_{[](fcitx::InputContext &) { return new MinimeIcState; }};
     static constexpr size_t kRecentChars = 32, kBeforeChars = 64, kAfterChars = 32;
     int focused_ = 0;
+    bool focusMovedOnCurrent_ = false;  // 当前稳定候选列表上用户是否主动移离了第 0 项
     int inflight_ = 0;         // 已发出、还没收到预编辑/上屏响应的命令数
     bool discarding_ = false;  // resetEngine 丢弃在途组合期间抑制误上屏
 };

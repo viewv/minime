@@ -76,8 +76,12 @@ def targets(keep_data):
         out.append(os.path.join(CONFIG, "fcitx5/conf/minime.conf"))
     # 开发时 scripts/install_*.sh 装的
     out += [os.path.join(CONFIG, "systemd/user", u) for u in UNITS]
+    out += [os.path.join(CONFIG, "systemd/user", u) for u in
+            ("wetype-engined.service", "wetype-netd.service", "wetype-asrd.socket", "wetype-asrd.service")]
     out.append(os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "applications/minime-settings.desktop"))
-    out += [os.path.join(HOME, ".local/bin", b) for b in ("minime-settings", "minime-netd", "minime-asrd")]
+    out.append(os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "applications/wetype-settings.desktop"))
+    out += [os.path.join(HOME, ".local/bin", b) for b in
+            ("minime-settings", "minime-netd", "minime-asrd", "wetype-settings")]
     return [p for p in out if os.path.lexists(p)]
 
 
@@ -98,7 +102,10 @@ def remove_from_fcitx5(dry):
         return "fcitx5 没在运行，跳过（输入法列表里的 MinIME 下次启动 fcitx5 时会因为插件不在而消失）"
     changed = []
     for group in groups[0]:
-        layout, items = fcitx("InputMethodGroupInfo", "s", group)
+        info = fcitx("InputMethodGroupInfo", "s", group)
+        if not info or len(info) < 2:
+            continue
+        layout, items = info[0], info[1]
         rest = [it for it in items if it[0] != "minime"]
         if len(rest) == len(items):
             continue
@@ -128,8 +135,10 @@ def stop_services(dry):
 
 
 def package_hint():
-    if shutil.which("pacman") and (r := run(["pacman", "-Q", "minime-git"])) and r.returncode == 0:
-        return "sudo pacman -R minime-git"
+    if shutil.which("pacman"):
+        for pkg in ("minime", "minime-git"):
+            if (r := run(["pacman", "-Q", pkg])) and r.returncode == 0:
+                return "sudo pacman -R " + pkg
     if shutil.which("dpkg-query") and (r := run(["dpkg-query", "-W", "minime"])) and r.returncode == 0:
         return "sudo apt remove minime"
     if shutil.which("rpm") and (r := run(["rpm", "-q", "minime"])) and r.returncode == 0:

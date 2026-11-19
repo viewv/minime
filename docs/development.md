@@ -37,6 +37,8 @@ scripts/install_fcitx5_addon.sh                       # fcitx5 插件（需要 s
 scripts/install_netd.sh && scripts/install_asrd.sh && scripts/install_settings.sh
 ```
 
+> 开发安装脚本会把服务单元写进 `~/.config/systemd/user/`、把快捷方式和链接写进 `~/.local/`（在 systemd 和桌面环境里的优先级高于系统软件包 `/usr/lib/systemd/user/`）。如果以后改回安装发行版软件包，请先删掉 `~/.config/systemd/user/minime-*`、`~/.local/share/applications/minime-settings.desktop` 和 `~/.local/bin/minime-*`，再运行 `systemctl --user daemon-reload`，免得服务仍指向旧仓库（注意：`minime-uninstall --keep-data` 会一并删掉已下载的官方引擎和模型）。
+
 前台运行引擎服务，方便看日志：
 
 ```bash

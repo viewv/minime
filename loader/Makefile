@@ -2,7 +2,7 @@
 # make            构建 build/native/ 下的测试程序
 # make test-tflite 原生和 Wine 各跑一次 TFLite 冒烟测试并比对输出
 CC      ?= gcc
-CFLAGS  := -O2 -g -Wall -Wextra -std=gnu11 -fno-strict-aliasing -Wno-unused-parameter
+override CFLAGS += -O2 -g -Wall -Wextra -std=gnu11 -fno-strict-aliasing -Wno-unused-parameter
 BUILD   := ../build/native
 VENDOR  := ../vendor/win/3.0.1.35
 OBJS    := $(BUILD)/pe.o $(BUILD)/kernel32.o $(BUILD)/files.o $(BUILD)/stub.o

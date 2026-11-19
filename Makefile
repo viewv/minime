@@ -9,7 +9,8 @@ PREFIX     ?= /usr
 BINDIR     ?= $(PREFIX)/bin
 LIBDIR     ?= $(PREFIX)/lib
 DATADIR    ?= $(PREFIX)/share
-USERUNITDIR ?= $(LIBDIR)/systemd/user
+# systemd 用户单元统一在 $(PREFIX)/lib/systemd/user，不跟随 Fedora /usr/lib64 或 Debian multiarch LIBDIR
+USERUNITDIR ?= $(if $(filter /usr,$(PREFIX)),$(shell pkg-config --variable=systemduserunitdir systemd 2>/dev/null || echo $(PREFIX)/lib/systemd/user),$(PREFIX)/lib/systemd/user)
 # fcitx5 插件目录跟着 fcitx5 自己的 libdir 走（Arch /usr/lib、Debian /usr/lib/x86_64-linux-gnu、Fedora /usr/lib64）
 FCITX5LIBDIR ?= $(shell pkg-config --variable=libdir Fcitx5Core 2>/dev/null || echo $(LIBDIR))/fcitx5
 VERSION    := $(shell cat VERSION)
@@ -20,14 +21,16 @@ ADDON_BUILD := fcitx5-minime/build
 
 .PHONY: all engined addon netd settings asrd install uninstall clean
 
+# 避免顶层并行同时启动多个 Cargo/CMake 构建耗尽内存；各子构建内部仍按 jobserver / --parallel / Cargo 并发
+.NOTPARALLEL:
 all: engined addon netd settings asrd
 
 engined:
-	$(MAKE) -C src native
+	$(MAKE) -C src ../build/native/engined
 
 addon:
 	cmake -S fcitx5-minime -B $(ADDON_BUILD) -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(PREFIX)
-	cmake --build $(ADDON_BUILD)
+	cmake --build $(ADDON_BUILD) --parallel
 
 netd:
 	cd netd && $(CARGO) build $(CARGOFLAGS)
@@ -47,7 +50,6 @@ install:
 	install -Dm755 scripts/minime-uninstall        $(DESTDIR)$(BINDIR)/minime-uninstall
 	install -Dm755 $(ADDON_BUILD)/libminime.so     $(DESTDIR)$(FCITX5LIBDIR)/libminime.so
 	install -Dm644 fcitx5-minime/minime-addon.conf $(DESTDIR)$(DATADIR)/fcitx5/addon/minime.conf
-	sed -i 's|^Library=.*|Library=libminime|'      $(DESTDIR)$(DATADIR)/fcitx5/addon/minime.conf
 	install -Dm644 fcitx5-minime/minime-inputmethod.conf $(DESTDIR)$(DATADIR)/fcitx5/inputmethod/minime.conf
 	install -Dm644 -t $(DESTDIR)$(USERUNITDIR) packaging/systemd/minime-engined.service \
 		packaging/systemd/minime-netd.service packaging/systemd/minime-asrd.service packaging/systemd/minime-asrd.socket

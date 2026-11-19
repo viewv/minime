@@ -31,6 +31,9 @@ use minime_netd::session::{Clip, Group, Res, Session, CLIP_IMAGE, CLIP_IMAGE_ORI
 const HEARTBEAT: Duration = Duration::from_secs(25);
 const CONFIG_POLL: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+const CLIP_RETRY_MIN: Duration = Duration::from_secs(2);
+const CLIP_RETRY_MAX: Duration = Duration::from_secs(60);
+const CLIP_STABLE_AFTER: Duration = Duration::from_secs(10);
 
 macro_rules! log {
     ($($t:tt)*) => { eprintln!("[netd] {}", format!($($t)*)) };
@@ -456,10 +459,14 @@ async fn on_local_clip(st: &mut State<'_>) {
     }
 }
 
+fn mark_clip_version(st: &mut State<'_>, ver: u64) {
+    st.persist.clip_version = Some(st.persist.clip_version.unwrap_or(0).max(ver));
+}
+
 /// 把对端的剪贴板写进本机。
 async fn apply_remote(st: &mut State<'_>, clip: Clip) {
-    st.persist.clip_version = Some(st.persist.clip_version.unwrap_or(0).max(clip.version));
     if clip.from_uin == st.session.uin() || !st.cfg.clipboard {
+        mark_clip_version(st, clip.version);
         return;
     }
     log!("peer clipboard: type {} ({} bytes, extra_info {} bytes, version {})", clip.kind, clip.data.len(), clip.extra_len, clip.version);
@@ -480,10 +487,12 @@ async fn apply_remote(st: &mut State<'_>, clip: Clip) {
     };
     if let Some(text) = text {
         if st.last_clip.as_deref() == Some(text.as_str()) {
+            mark_clip_version(st, clip.version);
             return;
         }
         match clipboard::write_text(&text).await {
             Ok(()) => {
+                mark_clip_version(st, clip.version);
                 st.last_clip = Some(text.clone());
                 st.persist.received += 1;
                 log!("clipboard <- peer ({} chars, version {})", text.chars().count(), clip.version);
@@ -493,9 +502,11 @@ async fn apply_remote(st: &mut State<'_>, clip: Clip) {
         return;
     }
     if clip.kind != CLIP_IMAGE && clip.kind != CLIP_IMAGE_ORI {
+        mark_clip_version(st, clip.version);
         return log!("peer sent clipboard type {} (ignored)", clip.kind);
     }
     if !st.cfg.images {
+        mark_clip_version(st, clip.version);
         return log!("peer sent an image (image sync is off)");
     }
     let data = if clip.kind == CLIP_IMAGE {
@@ -515,10 +526,12 @@ async fn apply_remote(st: &mut State<'_>, clip: Clip) {
         clip.data.clone()
     };
     let Some(mime) = clipboard::image_mime(&data) else {
+        mark_clip_version(st, clip.version);
         return log!("peer image: unknown format (head {})", hex::encode(&data[..data.len().min(16)]));
     };
     match clipboard::write_image(mime, &data).await {
         Ok(()) => {
+            mark_clip_version(st, clip.version);
             st.last_clip = Some(format!("img:{}", minime_netd::crypto::md5_upper(&data)));
             st.ignore_image_echo_until = Some(Instant::now() + Duration::from_secs(3));
             st.persist.received += 1;
@@ -959,19 +972,31 @@ async fn run_session(
     fetch_ab(&session).await;
     log!("connected (uin {}, paired={})", session.uin(), st.paired());
 
-    let mut clip_rx = if cfg.clipboard {
-        match clipboard::watch() {
-            Ok(rx) => Some(rx),
+    let mut clip_rx: Option<mpsc::UnboundedReceiver<()>> = None;
+    let mut clip_started: Option<Instant> = None;
+    let mut clip_retry_at: Option<tokio::time::Instant> = None;
+    let mut clip_backoff = CLIP_RETRY_MIN;
+    let mut clip_warned = false;
+    if cfg.clipboard {
+        match clipboard::watch().await {
+            Ok(rx) => {
+                clip_rx = Some(rx);
+                clip_started = Some(Instant::now());
+            }
             Err(e) => {
-                log!("wl-paste unavailable ({e}); clipboard sync disabled");
-                None
+                log!("clipboard watch not ready ({e}); will retry");
+                clip_warned = true;
+                clip_retry_at = Some(tokio::time::Instant::now() + clip_backoff);
+                clip_backoff = (clip_backoff * 2).min(CLIP_RETRY_MAX);
             }
         }
+    }
+    // 启动时剪贴板里已有的内容不发：只同步之后的变化
+    st.last_clip = if cfg.clipboard && clip_rx.is_some() {
+        fingerprint(&clipboard::read(cfg.images).await)
     } else {
         None
     };
-    // 启动时剪贴板里已有的内容不发：只同步之后的变化
-    st.last_clip = fingerprint(&clipboard::read(cfg.images).await);
     // 断线期间对端发过剪贴板：补拉那一条（首次启动只记版本，不应用旧内容）
     if st.paired() {
         match session.group(2, 0).await {
@@ -1001,10 +1026,49 @@ async fn run_session(
                 None => break Exit::Lost("connection closed".into()),
             },
             res = async { match clip_rx.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => match res {
-                Some(()) => on_local_clip(&mut st).await,
+                Some(()) => {
+                    if clip_warned {
+                        log!("clipboard watch active");
+                        clip_warned = false;
+                    }
+                    clip_backoff = CLIP_RETRY_MIN;
+                    on_local_clip(&mut st).await;
+                }
                 None => {
-                    log!("wl-paste --watch exited; clipboard watch disabled");
+                    let stable = clip_started.take().map(|t| t.elapsed() >= CLIP_STABLE_AFTER).unwrap_or(false);
+                    if stable {
+                        clip_backoff = CLIP_RETRY_MIN;
+                        log!("wl-paste --watch exited; retrying in {}s", clip_backoff.as_secs());
+                        clip_warned = true;
+                    } else if !clip_warned {
+                        log!("wl-paste --watch exited immediately; will retry with backoff");
+                        clip_warned = true;
+                    }
                     clip_rx = None;
+                    clip_retry_at = Some(tokio::time::Instant::now() + clip_backoff);
+                    clip_backoff = (clip_backoff * 2).min(CLIP_RETRY_MAX);
+                }
+            },
+            _ = async { match clip_retry_at { Some(t) => tokio::time::sleep_until(t).await, None => std::future::pending().await } } => {
+                clip_retry_at = None;
+                if cfg.clipboard && clip_rx.is_none() {
+                    match clipboard::watch().await {
+                        Ok(rx) => {
+                            clip_rx = Some(rx);
+                            clip_started = Some(Instant::now());
+                            if st.last_clip.is_none() {
+                                st.last_clip = fingerprint(&clipboard::read(cfg.images).await);
+                            }
+                        }
+                        Err(e) => {
+                            if !clip_warned {
+                                log!("clipboard watch not ready ({e}); will retry");
+                                clip_warned = true;
+                            }
+                            clip_retry_at = Some(tokio::time::Instant::now() + clip_backoff);
+                            clip_backoff = (clip_backoff * 2).min(CLIP_RETRY_MAX);
+                        }
+                    }
                 }
             },
             Some(()) = refresh_rx.recv() => {
@@ -1029,6 +1093,13 @@ async fn run_session(
                 }
             }
             _ = cfg_tick.tick() => {
+                if clip_rx.is_some() && clip_started.map(|t| t.elapsed() >= CLIP_STABLE_AFTER).unwrap_or(false) {
+                    clip_backoff = CLIP_RETRY_MIN;
+                    if clip_warned {
+                        log!("clipboard watch active");
+                        clip_warned = false;
+                    }
+                }
                 let m = config::mtime();
                 if m != cfg_mtime {
                     cfg_mtime = m;

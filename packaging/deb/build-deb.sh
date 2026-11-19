@@ -24,8 +24,10 @@ rm -rf "$STAGE/root/usr/share/licenses"
 # dpkg-shlibdeps 要在一个有 debian/control 的目录里跑
 mkdir -p "$STAGE/debian"
 printf 'Source: minime\n\nPackage: minime\nArchitecture: any\n' > "$STAGE/debian/control"
-BINS=$(find "$STAGE/root/usr/bin" "$STAGE/root/usr/lib" -type f \( -perm -u+x -o -name '*.so' \) -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print)
-SHLIBS=$(cd "$STAGE" && dpkg-shlibdeps -O $BINS 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
+mapfile -t BINS < <(find "$STAGE/root/usr/bin" "$STAGE/root/usr/lib" -type f \( -perm -u+x -o -name '*.so' \) -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print)
+[ "${#BINS[@]}" -gt 0 ] || { echo "未找到可分析的 ELF 二进制文件" >&2; exit 1; }
+SHLIBS=$(cd "$STAGE" && dpkg-shlibdeps -O "${BINS[@]}" | sed -n 's/^shlibs:Depends=//p')
+[ -n "$SHLIBS" ] || { echo "dpkg-shlibdeps 未解析出任何共享库依赖" >&2; exit 1; }
 
 SIZE=$(du -sk "$STAGE/root" | cut -f1)
 mkdir -p "$STAGE/root/DEBIAN"
@@ -50,13 +52,17 @@ cat > "$STAGE/root/DEBIAN/postinst" <<'POST'
 #!/bin/sh
 set -e
 if [ "$1" = configure ]; then
-  cat <<'MSG'
+  if [ -n "${2:-}" ]; then
+    echo "MinIME 已更新：运行 minime-fetch setup（重启引擎服务），再重新登录或重启 fcitx5 生效"
+  else
+    cat <<'MSG'
 MinIME 已安装。接下来以普通用户身份运行（不要用 sudo）：
   minime-fetch
 它会从腾讯官方下载引擎和整句模型，启动引擎服务，并把 MinIME 加进 fcitx5 的输入法列表。
 fcitx5 要先设为系统的输入法（KDE：系统设置 → 键盘 → 虚拟键盘 → Fcitx 5），然后按 Ctrl+Space 切换。
 详见 https://github.com/viewv/minime#安装
 MSG
+  fi
 fi
 POST
 chmod 755 "$STAGE/root/DEBIAN/postinst"

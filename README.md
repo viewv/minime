@@ -3,10 +3,10 @@
 *Yet another Linux port of the WeType engine* —— 在 Linux 上原生运行微信输入法引擎的 fcitx5 输入法。
 
 > [!WARNING]
-> **测试版（0.2.0）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
+> **测试版（0.2.1）**：MinIME 还处在早期测试阶段，可能存在大量问题，包括崩溃、输入异常和配置不兼容，
 > 不建议作为唯一的输入法使用。
 >
-> **Beta (0.2.0)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
+> **Beta (0.2.1)**: MinIME is at an early testing stage and may have many problems. Do not rely on it as
 > your only input method. 
 
 <p align="center">

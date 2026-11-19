@@ -59,6 +59,10 @@ def data_home():
     return os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
 
 
+def config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+
+
 OFFICIAL = os.path.join(data_home(), "minime", "official")
 ENGINE_DIR = os.path.join(OFFICIAL, "win", WIN_VERSION)
 E2E_DIR = os.path.join(OFFICIAL, "mac", "imeData")
@@ -314,9 +318,9 @@ def fetch_voice(force=False):
         stage("voice", "skip")
         say("语音模型：已安装")
         return
+    b = asrd_bin() or die("没有找到 minime-asrd（离线语音组件没有安装）")
     if force and os.path.isdir(model_dir):
         shutil.rmtree(model_dir, ignore_errors=True)
-    b = asrd_bin() or die("没有找到 minime-asrd（离线语音组件没有安装）")
     say("下载语音模型（约 100 MB）")
     if not JSON:
         subprocess.run([b, "fetch-model"], check=True)
@@ -379,6 +383,9 @@ def setup_service():
     if not shutil.which("systemctl"):
         say("提示：没有 systemctl，请自己启动 minime-engined")
         return
+    user_unit = os.path.join(config_home(), "systemd", "user", "minime-engined.service")
+    if os.path.lexists(user_unit) and os.path.lexists("/usr/lib/systemd/user/minime-engined.service"):
+        say("提示：检测到开发期用户单元 %s 正在覆盖系统软件包服务；如已改用系统包，请删掉 ~/.config/systemd/user/minime-* 并运行 systemctl --user daemon-reload" % user_unit)
     if (r := run(["systemctl", "--user", "cat", "minime-engined"])) is None or r.returncode != 0:
         say("提示：没有找到 minime-engined 用户服务（MinIME 的软件包装好了吗？）")
         return
@@ -415,8 +422,16 @@ def setup_fcitx5():
     if not has():
         say("提示：fcitx5 还没有加载 MinIME 插件。重新登录（或重启 fcitx5）后再运行 minime-fetch setup")
         return
-    group = fcitx("CurrentInputMethodGroup")[0]
-    layout, items = fcitx("InputMethodGroupInfo", "s", group)
+    grp = fcitx("CurrentInputMethodGroup")
+    if not grp:
+        say("提示：未能读取 fcitx5 当前输入法分组（fcitx5 可能刚退出），请稍后再运行 minime-fetch setup")
+        return
+    group = grp[0]
+    info = fcitx("InputMethodGroupInfo", "s", group)
+    if not info or len(info) < 2:
+        say("提示：未能读取 fcitx5 输入法分组 %s 的详情，请在 fcitx5 配置里手动添加" % group)
+        return
+    layout, items = info[0], info[1]
     if any(im == "minime" for im, _ in items):
         say("fcitx5：MinIME 已经在输入法列表里（Ctrl+Space 切换）")
         return

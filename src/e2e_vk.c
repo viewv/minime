@@ -44,6 +44,11 @@ static const uint32_t spv_mq4[] =
 static const uint32_t spv_mq8[] =
 #include "matmul_q8.spv.h"
     ;
+static const uint32_t spv_mq4_sg[] =
+#include "matmul_q4_sg.spv.h"
+    ;
+static const uint32_t spv_mq8_sg[] =
+#include "matmul_q8_sg.spv.h"
     ;
 static const uint32_t spv_attn[] =
 #include "attn.spv.h"
@@ -56,10 +61,10 @@ static const uint32_t var_nb[NVAR] = { 1, 4, 8 };
 static int var_of(int B) { return B <= 1 ? 0 : B <= 4 ? 1 : 2; }
 
 #define VKFN(X) \
-    X(vkCreateInstance) X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) \
+    X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkCreateDevice) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
-    X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) \
+    X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkInvalidateMappedMemoryRanges) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) \
     X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateComputePipelines) \
     X(vkDestroyPipeline) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
@@ -75,6 +80,7 @@ typedef struct {
     VkDeviceMemory mem;
     VkDeviceSize size;
     void *map;
+    int coherent;
 } Buf;
 
 typedef struct { const uint16_t *qkvb, *ob, *upb, *downb; } Bias16;
@@ -85,6 +91,7 @@ typedef struct {
     const uint8_t *wbase;          /* 模型文件起点（算偏移用） */
     void *lib;
     PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkCreateInstance vkCreateInstance;
 #define DECL(f) PFN_##f f;
     VKFN(DECL)
 #undef DECL
@@ -100,7 +107,8 @@ typedef struct {
     VkPipelineLayout pl;
     VkPipeline pipe[P_COUNT];
     VkPipeline mq4[NVAR], mq8[NVAR];
-    uint32_t rb, cl;               /* 矩阵乘：一个工作组几个 8 行块、一个块几个 32 线程簇 */
+    uint32_t cl, max_sg;           /* 矩阵乘：每个 8 行块一个工作组（32*cl 线程），max_sg 为 CL 或共享内存子组槽数 */
+    int use_cluster32;             /* 1: 用 32 宽簇内归约（AMD/NV）；0: 用通用 subgroupAdd（Intel 等可变 SIMD 宽度） */
     VkDescriptorPool dpool;
     VkDescriptorSet ds;
     VkCommandPool cpool;
@@ -141,17 +149,28 @@ static int buf_new(Vk *v, Buf *b, VkDeviceSize size, VkBufferUsageFlags usage, i
         return -1;
     VkMemoryRequirements mr;
     v->vkGetBufferMemoryRequirements(v->dev, b->buf, &mr);
-    /* 上传用：CPU 只写，优先设备本地；回读用：CPU 要读，必须可缓存 */
-    int mt = host == MEM_UPLOAD ? find_mem(v, mr.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-           : host == MEM_READBACK ? find_mem(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                                             VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-           : find_mem(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    /* 上传用：CPU 只写，优先设备本地；回读用：CPU 要读，优先可缓存（非 coherent 时在读回前 invalidate） */
+    int mt;
+    if (host == MEM_UPLOAD) {
+        mt = find_mem(v, mr.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    } else if (host == MEM_READBACK) {
+        mt = find_mem(v, mr.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt < 0)
+            mt = find_mem(v, mr.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    } else {
+        mt = find_mem(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    }
     if (mt < 0) {
         buf_free(v, b);
         return -1;
     }
+    b->coherent = (v->memp.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
                                 .memoryTypeIndex = (uint32_t)mt };
     if (v->vkAllocateMemory(v->dev, &ai, NULL, &b->mem) != VK_SUCCESS) {
@@ -299,7 +318,7 @@ static void mm_q4(Vk *v, const E2EQMat *m, const uint16_t *bias16, uint32_t xoff
     uint32_t pc[10] = { (uint32_t)m->R, (uint32_t)m->C, woff(v, m->q), woff(v, m->s),
                         bias16 ? hoff(v, bias16) : 0xffffffffu, xoff, yoff, (uint32_t)B, mode, (uint32_t)l };
     int k = var_of(B);
-    dispatch_pipe(v, P_MQ4, v->mq4[k], pc, 10, ((uint32_t)m->R / 8 + v->rb - 1) / v->rb, ((uint32_t)B + var_nb[k] - 1) / var_nb[k]);
+    dispatch_pipe(v, P_MQ4, v->mq4[k], pc, 10, (uint32_t)(m->R / 8), ((uint32_t)B + var_nb[k] - 1) / var_nb[k]);
 }
 
 typedef struct { const E2EBatch *bt; } FwdArg;
@@ -336,7 +355,7 @@ static void rec_forward(Vk *v, void *a)
         dispatch(v, P_LN, lf, 5, (uint32_t)nl, 1);
         uint32_t hq[7] = { V, H, woff(v, w->head.q), woff(v, w->head.s), A_HN, 0, (uint32_t)nl };
         int k = var_of(nl);
-        dispatch_pipe(v, P_MQ8, v->mq8[k], hq, 7, (V / 8 + v->rb - 1) / v->rb, ((uint32_t)nl + var_nb[k] - 1) / var_nb[k]);
+        dispatch_pipe(v, P_MQ8, v->mq8[k], hq, 7, V / 8, ((uint32_t)nl + var_nb[k] - 1) / var_nb[k]);
     }
 }
 
@@ -349,16 +368,22 @@ static int vk_forward(E2EBackend *b, const E2EBatch *bt)
     int32_t *in = v->in.map;
     size_t total = 0;
     for (int i = 0; i < B; i++) {
-        if (bt->slot[i] < 0 || bt->slot[i] >= v->cap || bt->ctx_len[i] > 1024)
+        if ((unsigned)bt->tok[i] >= V || (unsigned)bt->pos[i] >= PMAX ||
+            bt->slot[i] < 0 || bt->slot[i] >= v->cap ||
+            bt->ctx_len[i] < 0 || bt->ctx_len[i] > 1024)
             return -1;
+        if (total + (size_t)bt->ctx_len[i] > MAXCTX_TOTAL)
+            return -1;
+        const int *src_ctx = bt->ctx + bt->ctx_off[i];
+        for (int j = 0; j < bt->ctx_len[i]; j++)
+            if (src_ctx[j] < 0 || src_ctx[j] >= v->cap)
+                return -1;
         in[IN_TOK + i] = bt->tok[i];
         in[IN_POS + i] = bt->pos[i];
         in[IN_SLOT + i] = bt->slot[i];
         in[IN_OFF + i] = (int32_t)total;
         in[IN_LEN + i] = bt->ctx_len[i];
-        if (total + (size_t)bt->ctx_len[i] > MAXCTX_TOTAL)
-            return -1;
-        memcpy(in + IN_CTX + total, bt->ctx + bt->ctx_off[i], sizeof(int) * (size_t)bt->ctx_len[i]);
+        memcpy(in + IN_CTX + total, src_ctx, sizeof(int) * (size_t)bt->ctx_len[i]);
         total += (size_t)bt->ctx_len[i];
     }
     FwdArg a = { bt };
@@ -379,8 +404,15 @@ static int vk_forward(E2EBackend *b, const E2EBatch *bt)
             }
     }
     int nl = B - bt->logits_from;
-    if (nl > 0)
+    if (nl > 0) {
+        if (!v->lg.coherent) {
+            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                       .memory = v->lg.mem, .offset = 0, .size = VK_WHOLE_SIZE };
+            if (v->vkInvalidateMappedMemoryRanges(v->dev, 1, &mr) != VK_SUCCESS)
+                return -1;
+        }
         memcpy(bt->logits, v->lg.map, sizeof(float) * (size_t)nl * V);
+    }
     return 0;
 }
 
@@ -417,7 +449,7 @@ static void vk_destroy(E2EBackend *b)
         buf_free(v, &v->W); buf_free(v, &v->act); buf_free(v, &v->kv); buf_free(v, &v->in); buf_free(v, &v->lg);
         v->vkDestroyDevice(v->dev, NULL);
     }
-    if (v->inst) v->vkDestroyInstance(v->inst, NULL);
+    if (v->inst && v->vkDestroyInstance) v->vkDestroyInstance(v->inst, NULL);
     if (v->lib) dlclose(v->lib);
     free(v);
 }
@@ -453,10 +485,8 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
     v->base.destroy = vk_destroy;
     v->w = w;
     v->skip = getenv("MINIME_E2E_VK_SKIP") ? (unsigned)strtoul(getenv("MINIME_E2E_VK_SKIP"), NULL, 0) : 0;
-    v->rb = getenv("MINIME_E2E_VK_RB") ? (uint32_t)atoi(getenv("MINIME_E2E_VK_RB")) : 1;   /* 默认值是在 780M 上按逐键输入实测选的 */
-    if (v->rb < 1 || v->rb > 32) v->rb = 1;
     v->cl = getenv("MINIME_E2E_VK_CL") ? (uint32_t)atoi(getenv("MINIME_E2E_VK_CL")) : 2;
-    if (v->cl < 1 || v->rb * v->cl > 32) v->cl = 1;
+    if (v->cl < 1 || v->cl > 4) v->cl = 2;
     /* 模型文件起点：wte 所在页往前找 "XLLM" 魔数（张量都在同一个 mmap 里） */
     const uint8_t *p = (const uint8_t *)((uintptr_t)w->wte & ~(uintptr_t)4095);
     while (memcmp(p, "XLLM", 4))
@@ -476,6 +506,8 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
     if (!v->lib)
         FAIL("没有 libvulkan.so.1");
     v->gipa = (PFN_vkGetInstanceProcAddr)dlsym(v->lib, "vkGetInstanceProcAddr");
+    if (!v->gipa)
+        FAIL("找不到 vkGetInstanceProcAddr");
     v->vkCreateInstance = (PFN_vkCreateInstance)v->gipa(NULL, "vkCreateInstance");
     if (!v->vkCreateInstance)
         FAIL("Vulkan 装载器不可用");
@@ -484,7 +516,7 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     if (v->vkCreateInstance(&ici, NULL, &v->inst) != VK_SUCCESS)
         FAIL("vkCreateInstance 失败");
-#define LOADI(f) v->f = (PFN_##f)v->gipa(v->inst, #f);
+#define LOADI(f) do { v->f = (PFN_##f)v->gipa(v->inst, #f); if (!v->f) FAIL("Vulkan 驱动缺少 %s（需要 Vulkan 1.1）", #f); } while (0);
     VKFN(LOADI)
 #undef LOADI
     uint32_t n = 0;
@@ -494,29 +526,61 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
     VkPhysicalDevice devs[16];
     if (n > 16) n = 16;
     v->vkEnumeratePhysicalDevices(v->inst, &n, devs);
-    /* 选设备：独显 > 核显 > 其他（不用软件渲染的 llvmpipe，除非设了 MINIME_E2E_VK_CPU） */
+    /* 选设备：跳过 Vulkan 1.0 老设备；独显 > 核显 > 其他（不用软件渲染的 llvmpipe，除非设了 MINIME_E2E_VK_CPU） */
     int best = -1, bestscore = -1;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties pr;
         v->vkGetPhysicalDeviceProperties(devs[i], &pr);
+        if (pr.apiVersion < VK_API_VERSION_1_1)
+            continue;
         int s = pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
               : pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
               : pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? (getenv("MINIME_E2E_VK_CPU") ? 1 : -1) : 0;
         if (s > bestscore) { bestscore = s; best = (int)i; }
     }
     if (best < 0 || bestscore < 0)
-        FAIL("没有可用的 GPU");
+        FAIL("没有可用的 Vulkan 1.1 GPU");
     v->pd = devs[best];
     VkPhysicalDeviceProperties pr;
     v->vkGetPhysicalDeviceProperties(v->pd, &pr);
     snprintf(v->name, sizeof v->name, "vulkan（%s）", pr.deviceName);
-    /* 矩阵乘用 32 宽的簇内归约（subgroupClusteredAdd），要求子组至少 32 宽并支持 clustered 操作 */
-    VkPhysicalDeviceSubgroupProperties sgp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+    /* 矩阵乘默认用 32 宽簇内归约（AMD/NV 原生满速）；Intel 核显及可变子组宽度设备用通用 subgroupAdd */
+    VkPhysicalDeviceSubgroupSizeControlProperties sscp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES
+    };
+    VkPhysicalDeviceSubgroupProperties sgp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+        .pNext = pr.apiVersion >= VK_API_VERSION_1_3 ? &sscp : NULL
+    };
     VkPhysicalDeviceProperties2 pr2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp };
     v->vkGetPhysicalDeviceProperties2(v->pd, &pr2);
-    if (sgp.subgroupSize < 32 || !(sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
-        !(sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) || !(sgp.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT))
+    if (sgp.subgroupSize < 4 || !(sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+        !(sgp.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT))
         FAIL("%s 的子组不满足要求（宽 %u，操作 0x%x）", pr.deviceName, sgp.subgroupSize, sgp.supportedOperations);
+    uint32_t min_sg = (pr.apiVersion >= VK_API_VERSION_1_3 && sscp.minSubgroupSize >= 4)
+        ? sscp.minSubgroupSize
+        : (pr.vendorID == 0x8086 ? 8u : (sgp.subgroupSize > 32u ? 32u : sgp.subgroupSize));
+    if (min_sg < 4)
+        FAIL("%s 的最小子组过小（%u）", pr.deviceName, min_sg);
+    int has_arith = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+    int has_clust = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) != 0;
+    v->use_cluster32 = pr.vendorID != 0x8086 && min_sg >= 32 && sgp.subgroupSize >= 32 &&
+                       has_clust && getenv("MINIME_E2E_VK_GENERIC_SG") == NULL;
+    if (!v->use_cluster32 && !has_arith)
+        FAIL("%s 的子组不支持算术归约（宽 %u，操作 0x%x）", pr.deviceName, sgp.subgroupSize, sgp.supportedOperations);
+    for (;;) {
+        uint32_t wg = 32u * v->cl;
+        v->max_sg = v->use_cluster32 ? v->cl : (wg + min_sg - 1u) / min_sg;
+        size_t shm = (size_t)v->max_sg * 8u * 8u * sizeof(float);
+        if (wg <= pr.limits.maxComputeWorkGroupSize[0] &&
+            wg <= pr.limits.maxComputeWorkGroupInvocations &&
+            shm <= pr.limits.maxComputeSharedMemorySize)
+            break;
+        if (v->cl > 1)
+            v->cl = 1;
+        else
+            FAIL("%s 的计算工作组或共享内存上限不足", pr.deviceName);
+    }
     v->vkGetPhysicalDeviceMemoryProperties(v->pd, &v->memp);
     uint32_t nq = 0;
     v->vkGetPhysicalDeviceQueueFamilyProperties(v->pd, &nq, NULL);
@@ -577,20 +641,23 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
                                        .pSetLayouts = &v->dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     v->vkCreatePipelineLayout(v->dev, &pli, NULL, &v->pl);
     struct { const uint32_t *code; size_t size; } sh[P_COUNT] = {
-        { spv_embed, sizeof spv_embed }, { spv_layernorm, sizeof spv_layernorm }, { spv_mq4, sizeof spv_mq4 },
-        { spv_mq8, sizeof spv_mq8 }, { spv_attn, sizeof spv_attn },
+        { spv_embed, sizeof spv_embed },
+        { spv_layernorm, sizeof spv_layernorm },
+        { v->use_cluster32 ? spv_mq4 : spv_mq4_sg, v->use_cluster32 ? sizeof spv_mq4 : sizeof spv_mq4_sg },
+        { v->use_cluster32 ? spv_mq8 : spv_mq8_sg, v->use_cluster32 ? sizeof spv_mq8 : sizeof spv_mq8_sg },
+        { spv_attn, sizeof spv_attn },
     };
     for (int i = 0; i < P_COUNT; i++) {
         VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sh[i].size, .pCode = sh[i].code };
         VkShaderModule mod;
         if (v->vkCreateShaderModule(v->dev, &smi, NULL, &mod) != VK_SUCCESS)
             FAIL("着色器 %d 创建失败", i);
-        /* 矩阵乘的特化常量：0 NB、1 RB、2 工作组大小（32*RB*CL）、3 CL */
+        /* 矩阵乘的特化常量：0 NB、1 CL/MAX_SG、2 工作组大小（32*CL） */
         int mm = i == P_MQ4 || i == P_MQ8;
         for (int k = 0; k < (mm ? NVAR : 1); k++) {
-            uint32_t spec[4] = { var_nb[k], v->rb, 32 * v->rb * v->cl, v->cl };
-            VkSpecializationMapEntry me[4] = { { 0, 0, 4 }, { 1, 4, 4 }, { 2, 8, 4 }, { 3, 12, 4 } };
-            VkSpecializationInfo si = { 4, me, sizeof spec, spec };
+            uint32_t spec[3] = { var_nb[k], v->max_sg, 32u * v->cl };
+            VkSpecializationMapEntry me[3] = { { 0, 0, 4 }, { 1, 4, 4 }, { 2, 8, 4 } };
+            VkSpecializationInfo si = { 3, me, sizeof spec, spec };
             VkComputePipelineCreateInfo pci = {
                 .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-minime VERSION 0.2.0 LANGUAGES CXX)
+project(fcitx5-minime VERSION 0.2.1 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
