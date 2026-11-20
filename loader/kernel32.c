@@ -8,8 +8,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/futex.h>
-#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -18,12 +16,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/random.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/sysinfo.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <malloc.h>
+#include <sys/random.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
+#elif defined(__FreeBSD__)
+#include <malloc_np.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <sys/umtx.h>
+#elif defined(__NetBSD__) || defined(__DragonFly__)
+#include <sys/param.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 
 #include "pe.h"
 #include "winabi.h"
@@ -32,10 +44,86 @@
 extern char **environ;
 
 /* ================= 小工具 ================= */
-static long futex(void *addr, int op, uint32_t val, const struct timespec *ts)
+#if defined(__linux__)
+static long futex_wait(void *addr, uint32_t val, const struct timespec *ts)
 {
-    return syscall(SYS_futex, addr, op, val, ts, NULL, 0);
+    return syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, val, ts, NULL, 0);
 }
+
+static long futex_wake(void *addr, int count)
+{
+    return syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, (uint32_t)count, NULL, NULL, 0);
+}
+#elif defined(__FreeBSD__)
+static long futex_wait(void *addr, uint32_t val, const struct timespec *ts)
+{
+    if (ts) {
+        struct _umtx_time ut;
+        memset(&ut, 0, sizeof(ut));
+        ut._timeout = *ts;
+        ut._flags = 0; /* 相对超时 */
+        ut._clockid = CLOCK_MONOTONIC;
+        return _umtx_op(addr, UMTX_OP_WAIT_UINT_PRIVATE, (u_long)val, (void *)(uintptr_t)sizeof(ut), &ut);
+    }
+    return _umtx_op(addr, UMTX_OP_WAIT_UINT_PRIVATE, (u_long)val, NULL, NULL);
+}
+
+static long futex_wake(void *addr, int count)
+{
+    return _umtx_op(addr, UMTX_OP_WAKE_PRIVATE, (u_long)count, NULL, NULL);
+}
+#else
+#define FUTEX_B1 { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER }
+#define FUTEX_B4 FUTEX_B1, FUTEX_B1, FUTEX_B1, FUTEX_B1
+#define FUTEX_B16 FUTEX_B4, FUTEX_B4, FUTEX_B4, FUTEX_B4
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+} g_futex_buckets[64] = { FUTEX_B16, FUTEX_B16, FUTEX_B16, FUTEX_B16 };
+#undef FUTEX_B16
+#undef FUTEX_B4
+#undef FUTEX_B1
+
+static inline size_t futex_bucket(const void *addr)
+{
+    return ((((uintptr_t)addr) >> 2) * 2654435761u) & 63u;
+}
+
+static long futex_wait(void *addr, uint32_t val, const struct timespec *ts)
+{
+    size_t idx = futex_bucket(addr);
+    pthread_mutex_lock(&g_futex_buckets[idx].mu);
+    if (atomic_load((_Atomic uint32_t *)addr) != val) {
+        pthread_mutex_unlock(&g_futex_buckets[idx].mu);
+        errno = EAGAIN;
+        return -1;
+    }
+    int r;
+    if (ts) {
+        uint64_t rt = now_ns(CLOCK_REALTIME) + (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+        struct timespec abs_ts = { (time_t)(rt / 1000000000ULL), (long)(rt % 1000000000ULL) };
+        r = pthread_cond_timedwait(&g_futex_buckets[idx].cv, &g_futex_buckets[idx].mu, &abs_ts);
+    } else {
+        r = pthread_cond_wait(&g_futex_buckets[idx].cv, &g_futex_buckets[idx].mu);
+    }
+    pthread_mutex_unlock(&g_futex_buckets[idx].mu);
+    if (r == ETIMEDOUT) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
+}
+
+static long futex_wake(void *addr, int count)
+{
+    (void)count;
+    size_t idx = futex_bucket(addr);
+    pthread_mutex_lock(&g_futex_buckets[idx].mu);
+    pthread_cond_broadcast(&g_futex_buckets[idx].cv);
+    pthread_mutex_unlock(&g_futex_buckets[idx].mu);
+    return 0;
+}
+#endif
 
 static void ms_to_timespec(DWORD ms, struct timespec *ts)
 {
@@ -58,11 +146,14 @@ size_t u16len(const WCHAR *s)
     return n;
 }
 
-/* UTF-16 -> UTF-8；n<0 表示到 0 为止。返回 malloc 的字符串 */
-char *u16_to_utf8(const WCHAR *s, long n)
+/* UTF-16 -> UTF-8；n<0 表示到 0 为止。返回 malloc 的字符串，可选输出字节长度（含嵌入 \0） */
+static char *u16_to_utf8_len(const WCHAR *s, long n, size_t *out_len)
 {
-    if (!s)
+    if (!s) {
+        if (out_len)
+            *out_len = 0;
         return NULL;
+    }
     if (n < 0)
         n = (long)u16len(s);
     char *out = malloc(n * 3 + 1), *o = out;
@@ -75,8 +166,15 @@ char *u16_to_utf8(const WCHAR *s, long n)
         else if (c < 0x10000) { *o++ = 0xe0 | (c >> 12); *o++ = 0x80 | ((c >> 6) & 0x3f); *o++ = 0x80 | (c & 0x3f); }
         else { *o++ = 0xf0 | (c >> 18); *o++ = 0x80 | ((c >> 12) & 0x3f); *o++ = 0x80 | ((c >> 6) & 0x3f); *o++ = 0x80 | (c & 0x3f); }
     }
+    if (out_len)
+        *out_len = (size_t)(o - out);
     *o = 0;
     return out;
+}
+
+char *u16_to_utf8(const WCHAR *s, long n)
+{
+    return u16_to_utf8_len(s, n, NULL);
 }
 
 /* UTF-8 -> UTF-16，写入 dst（可为 NULL 只计数），返回 WCHAR 数 */
@@ -133,6 +231,7 @@ static WINAPI void k32_SetLastError(DWORD e) { set_last_error(e); }
 
 static WINAPI HANDLE k32_GetProcessHeap(void) { return FAKE_PROCESS_HEAP; }
 
+#if defined(__linux__) || defined(__FreeBSD__)
 static WINAPI void *k32_HeapAlloc(HANDLE h, DWORD flags, SIZE_T n)
 {
     (void)h;
@@ -167,6 +266,80 @@ static WINAPI void *k32_HeapReAlloc(HANDLE h, DWORD flags, void *p, SIZE_T n)
     return q;
 }
 
+static WINAPI void *k32_LocalFree(void *p) { free(p); return NULL; }
+#else
+#define HEAP_HDR_MAGIC 0x4d48454150363455ULL
+typedef struct {
+    uint64_t magic;
+    size_t size;
+} HeapHdr;
+_Static_assert(sizeof(HeapHdr) == 16, "HeapHdr must preserve 16-byte alignment");
+
+static WINAPI void *k32_HeapAlloc(HANDLE h, DWORD flags, SIZE_T n)
+{
+    (void)h;
+    size_t sz = n ? (size_t)n : 1;
+    HeapHdr *hdr = (flags & HEAP_ZERO_MEMORY) ? calloc(1, sizeof(HeapHdr) + sz) : malloc(sizeof(HeapHdr) + sz);
+    if (!hdr) {
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    hdr->magic = HEAP_HDR_MAGIC;
+    hdr->size = sz;
+    return hdr + 1;
+}
+
+static WINAPI BOOL k32_HeapFree(HANDLE h, DWORD flags, void *p)
+{
+    (void)h; (void)flags;
+    if (!p)
+        return TRUE;
+    HeapHdr *hdr = ((HeapHdr *)p) - 1;
+    if (hdr->magic == HEAP_HDR_MAGIC) {
+        hdr->magic = 0;
+        free(hdr);
+    } else {
+        free(p);
+    }
+    return TRUE;
+}
+
+static WINAPI SIZE_T k32_HeapSize(HANDLE h, DWORD flags, const void *p)
+{
+    (void)h; (void)flags;
+    if (!p)
+        return 0;
+    const HeapHdr *hdr = ((const HeapHdr *)p) - 1;
+    return hdr->magic == HEAP_HDR_MAGIC ? (SIZE_T)hdr->size : 0;
+}
+
+static WINAPI void *k32_HeapReAlloc(HANDLE h, DWORD flags, void *p, SIZE_T n)
+{
+    (void)h;
+    if (!p)
+        return (flags & HEAP_REALLOC_IN_PLACE_ONLY) ? NULL : k32_HeapAlloc(h, flags, n);
+    HeapHdr *hdr = ((HeapHdr *)p) - 1;
+    if (hdr->magic != HEAP_HDR_MAGIC)
+        return NULL;
+    size_t old = hdr->size;
+    size_t sz = n ? (size_t)n : 1;
+    if (flags & HEAP_REALLOC_IN_PLACE_ONLY)
+        return sz <= old ? p : NULL;
+    HeapHdr *nhdr = realloc(hdr, sizeof(HeapHdr) + sz);
+    if (!nhdr) {
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    nhdr->size = sz;
+    void *q = nhdr + 1;
+    if ((flags & HEAP_ZERO_MEMORY) && sz > old)
+        memset((char *)q + old, 0, sz - old);
+    return q;
+}
+
+static WINAPI void *k32_LocalFree(void *p) { k32_HeapFree(FAKE_PROCESS_HEAP, 0, p); return NULL; }
+#endif
+
 static WINAPI BOOL k32_HeapValidate(HANDLE h, DWORD f, const void *p) { (void)h; (void)f; (void)p; return TRUE; }
 static WINAPI BOOL k32_HeapQueryInformation(HANDLE h, int c, void *i, SIZE_T l, SIZE_T *r)
 {
@@ -174,9 +347,18 @@ static WINAPI BOOL k32_HeapQueryInformation(HANDLE h, int c, void *i, SIZE_T l, 
     set_last_error(ERROR_CALL_NOT_IMPLEMENTED);
     return FALSE;
 }
-static WINAPI void *k32_LocalFree(void *p) { free(p); return NULL; }
 
 /* ================= 虚拟内存 ================= */
+#if defined(MAP_FIXED_NOREPLACE)
+#define PE_MAP_FIXED_NOREPLACE MAP_FIXED_NOREPLACE
+#elif defined(__FreeBSD__) && defined(MAP_EXCL)
+#define PE_MAP_FIXED_NOREPLACE (MAP_FIXED | MAP_EXCL)
+#elif defined(__NetBSD__) && defined(MAP_TRYFIXED)
+#define PE_MAP_FIXED_NOREPLACE MAP_TRYFIXED
+#else
+#define PE_MAP_FIXED_NOREPLACE 0
+#endif
+
 #define MEM_COMMIT  0x1000
 #define MEM_RESERVE 0x2000
 #define MEM_RELEASE 0x8000
@@ -214,7 +396,11 @@ static WINAPI void *k32_VirtualAlloc(void *addr, SIZE_T n, DWORD type, DWORD pro
         return NULL;
     }
     int pr = (type & MEM_COMMIT) ? page_prot(prot) : PROT_NONE;
-    void *p = mmap(addr, n, pr, MAP_PRIVATE | MAP_ANONYMOUS | (addr ? MAP_FIXED_NOREPLACE : 0), -1, 0);
+    void *p = mmap(addr, n, pr, MAP_PRIVATE | MAP_ANONYMOUS | (addr ? PE_MAP_FIXED_NOREPLACE : 0), -1, 0);
+    if (p != MAP_FAILED && addr && p != addr) {
+        munmap(p, n);
+        p = MAP_FAILED;
+    }
     if (p == MAP_FAILED) {
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
@@ -239,8 +425,15 @@ static WINAPI void *k32_VirtualAlloc(void *addr, SIZE_T n, DWORD type, DWORD pro
 
 static WINAPI BOOL k32_VirtualFree(void *addr, SIZE_T n, DWORD type)
 {
-    if (type & MEM_DECOMMIT)
+    if (type & MEM_DECOMMIT) {
+#ifdef __linux__
         return madvise(addr, n, MADV_DONTNEED) == 0 && mprotect(addr, n, PROT_NONE) == 0;
+#else
+        uintptr_t a = (uintptr_t)addr & ~4095UL;
+        size_t len = ((uintptr_t)addr + n - a + 4095) & ~4095UL;
+        return mmap((void *)a, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED;
+#endif
+    }
     pthread_mutex_lock(&g_vmem_lock);
     for (int i = 0; i < 4096; i++)
         if (g_vmem[i].p == addr) {
@@ -398,7 +591,7 @@ static WINAPI void k32_EnterCriticalSection(CritSec *cs)
     int32_t z = 0;
     if (!atomic_compare_exchange_strong(&cs->word, &z, 1)) {
         while (atomic_exchange(&cs->word, 2) != 0)
-            futex(&cs->word, FUTEX_WAIT_PRIVATE, 2, NULL);
+            futex_wait(&cs->word, 2, NULL);
     }
     atomic_store_explicit(&cs->owner, me, memory_order_relaxed);
     cs->recursion = 1;
@@ -425,7 +618,7 @@ static WINAPI void k32_LeaveCriticalSection(CritSec *cs)
         return;
     atomic_store_explicit(&cs->owner, 0, memory_order_relaxed);
     if (atomic_exchange(&cs->word, 0) == 2)
-        futex(&cs->word, FUTEX_WAKE_PRIVATE, 1, NULL);
+        futex_wake(&cs->word, 1);
 }
 
 /* ================= SRW 锁（8 字节：状态 + 等待者数） ================= */
@@ -443,7 +636,7 @@ static WINAPI void k32_AcquireSRWLockExclusive(SrwLock *l)
         if (s == 0)
             continue;
         atomic_fetch_add(&l->waiters, 1);
-        futex(&l->state, FUTEX_WAIT_PRIVATE, (uint32_t)s, NULL);
+        futex_wait(&l->state, (uint32_t)s, NULL);
         atomic_fetch_sub(&l->waiters, 1);
     }
 }
@@ -458,7 +651,7 @@ static WINAPI void k32_ReleaseSRWLockExclusive(SrwLock *l)
 {
     atomic_store(&l->state, 0);
     if (atomic_load(&l->waiters))
-        futex(&l->state, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL);
+        futex_wake(&l->state, INT32_MAX);
 }
 
 static WINAPI void k32_AcquireSRWLockShared(SrwLock *l)
@@ -471,7 +664,7 @@ static WINAPI void k32_AcquireSRWLockShared(SrwLock *l)
             continue;
         }
         atomic_fetch_add(&l->waiters, 1);
-        futex(&l->state, FUTEX_WAIT_PRIVATE, (uint32_t)s, NULL);
+        futex_wait(&l->state, (uint32_t)s, NULL);
         atomic_fetch_sub(&l->waiters, 1);
     }
 }
@@ -485,7 +678,7 @@ static WINAPI BOOL k32_TryAcquireSRWLockShared(SrwLock *l)
 static WINAPI void k32_ReleaseSRWLockShared(SrwLock *l)
 {
     if (atomic_fetch_sub(&l->state, 1) == 1 && atomic_load(&l->waiters))
-        futex(&l->state, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL);
+        futex_wake(&l->state, INT32_MAX);
 }
 
 /* ================= 条件变量（8 字节：序号） ================= */
@@ -496,12 +689,12 @@ static WINAPI void k32_InitializeConditionVariable(CondVar *c) { atomic_store(&c
 static WINAPI void k32_WakeConditionVariable(CondVar *c)
 {
     atomic_fetch_add(&c->seq, 1);
-    futex(&c->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
+    futex_wake(&c->seq, 1);
 }
 static WINAPI void k32_WakeAllConditionVariable(CondVar *c)
 {
     atomic_fetch_add(&c->seq, 1);
-    futex(&c->seq, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL);
+    futex_wake(&c->seq, INT32_MAX);
 }
 
 static WINAPI BOOL k32_SleepConditionVariableSRW(CondVar *c, SrwLock *l, DWORD ms, DWORD flags)
@@ -514,7 +707,7 @@ static WINAPI BOOL k32_SleepConditionVariableSRW(CondVar *c, SrwLock *l, DWORD m
         ms_to_timespec(ms, &ts);
         pts = &ts;
     }
-    long r = futex(&c->seq, FUTEX_WAIT_PRIVATE, s, pts);
+    long r = futex_wait(&c->seq, s, pts);
     int timed_out = r != 0 && errno == ETIMEDOUT;
     if (shared) k32_AcquireSRWLockShared(l); else k32_AcquireSRWLockExclusive(l);
     if (timed_out) {
@@ -535,7 +728,7 @@ static WINAPI BOOL k32_SleepConditionVariableCS(CondVar *c, CritSec *cs, DWORD m
         ms_to_timespec(ms, &ts);
         pts = &ts;
     }
-    long r = futex(&c->seq, FUTEX_WAIT_PRIVATE, s, pts);
+    long r = futex_wait(&c->seq, s, pts);
     int timed_out = r != 0 && errno == ETIMEDOUT;
     k32_EnterCriticalSection(cs);
     cs->recursion = rec;
@@ -573,7 +766,7 @@ static WINAPI BOOL k32_InitOnceBeginInitialize(InitOnce *o, DWORD flags, BOOL *p
             }
             continue;
         }
-        futex(&o->state, FUTEX_WAIT_PRIVATE, 1, NULL);
+        futex_wait(&o->state, 1, NULL);
     }
 }
 
@@ -581,7 +774,7 @@ static WINAPI BOOL k32_InitOnceComplete(InitOnce *o, DWORD flags, void *ctx)
 {
     (void)ctx;
     atomic_store(&o->state, (flags & INIT_ONCE_INIT_FAILED) ? 0 : 2);
-    futex(&o->state, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL);
+    futex_wake(&o->state, INT32_MAX);
     return TRUE;
 }
 
@@ -664,7 +857,7 @@ void ko_unref(KObj *o)
 {
     if (!o)
         return;
-    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) != 0)
+    if (atomic_fetch_sub_explicit(&o->refs, 1, memory_order_acq_rel) != 1)
         return;
     o->magic = 0;
     free(o->path);
@@ -1075,7 +1268,7 @@ static void *thread_trampoline(void *arg)
     KObj *o = arg;
     t_self = o;
     /* 先公布线程号再跑 DLL 通知：创建者在等线程号，期间可能持有别的锁 */
-    __atomic_store_n(&o->tid, (DWORD)syscall(SYS_gettid), __ATOMIC_RELEASE);
+    __atomic_store_n(&o->tid, (DWORD)pe_host_tid(), __ATOMIC_RELEASE);
     pe_thread_start_hooks();
     pthread_mutex_lock(&g_ko_lock);
     while (o->suspended)
@@ -1169,7 +1362,15 @@ static WINAPI HANDLE k32_GetCurrentThread(void) { return (HANDLE)(intptr_t)-2; }
 static WINAPI DWORD k32_GetCurrentThreadId(void) { return (DWORD)cur_tid(); }
 static WINAPI HANDLE k32_GetCurrentProcess(void) { return (HANDLE)(intptr_t)-1; }
 static WINAPI DWORD k32_GetCurrentProcessId(void) { return (DWORD)getpid(); }
-static WINAPI DWORD k32_GetCurrentProcessorNumber(void) { int c = sched_getcpu(); return c < 0 ? 0 : (DWORD)c; }
+static WINAPI DWORD k32_GetCurrentProcessorNumber(void)
+{
+#ifdef __linux__
+    int c = sched_getcpu();
+    return c < 0 ? 0 : (DWORD)c;
+#else
+    return 0;
+#endif
+}
 static WINAPI DWORD_PTR k32_SetThreadAffinityMask(HANDLE h, DWORD_PTR m) { (void)h; (void)m; return 1; }
 static WINAPI BOOL k32_SetThreadPriority(HANDLE h, int p) { (void)h; (void)p; return TRUE; }
 static WINAPI int k32_GetThreadPriority(HANDLE h) { (void)h; return 0; }
@@ -1584,11 +1785,7 @@ static WINAPI int k32_WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR src, int
             s[i] = src[i] < 256 ? (char)src[i] : '?';
         len = n;
     } else {
-        /* u16_to_utf8 以 0 结尾；n 里如果包含了结尾的 0，要把它也算进去 */
-        s = u16_to_utf8(src, n);
-        len = strlen(s);
-        if (n > 0 && src[n - 1] == 0)
-            len++;
+        s = u16_to_utf8_len(src, n, &len);
     }
     if (!dst || !cap) {
         free(s);
@@ -1997,9 +2194,37 @@ static WINAPI BOOL k32_GetLogicalProcessorInformationEx(int rel, uint8_t *buf, D
 
 static WINAPI BOOL k32_GlobalMemoryStatusEx(uint8_t *ms)
 {
+    uint64_t total = 0, avail = 0;
+#if defined(__linux__)
     struct sysinfo si;
     sysinfo(&si);
-    uint64_t total = (uint64_t)si.totalram * si.mem_unit, avail = (uint64_t)si.freeram * si.mem_unit;
+    total = (uint64_t)si.totalram * si.mem_unit;
+    avail = (uint64_t)si.freeram * si.mem_unit;
+#elif defined(__FreeBSD__)
+    size_t sz = sizeof(total);
+    if (sysctlbyname("hw.physmem", &total, &sz, NULL, 0) != 0) {
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long psize = sysconf(_SC_PAGESIZE);
+        total = (pages > 0 && psize > 0) ? (uint64_t)pages * (uint64_t)psize : (4ULL << 30);
+    }
+    unsigned int v_free = 0, v_inact = 0;
+    size_t fsz = sizeof(v_free), isz = sizeof(v_inact);
+    long psize = sysconf(_SC_PAGESIZE);
+    if (psize > 0 &&
+        sysctlbyname("vm.stats.vm.v_free_count", &v_free, &fsz, NULL, 0) == 0 &&
+        sysctlbyname("vm.stats.vm.v_inactive_count", &v_inact, &isz, NULL, 0) == 0) {
+        avail = ((uint64_t)v_free + (uint64_t)v_inact) * (uint64_t)psize;
+    } else {
+        avail = total / 2;
+    }
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGESIZE);
+    total = (pages > 0 && psize > 0) ? (uint64_t)pages * (uint64_t)psize : (4ULL << 30);
+    avail = total / 2;
+#endif
+    if (avail > total)
+        avail = total;
     *(DWORD *)(ms + 4) = total ? (DWORD)(100 - avail * 100 / total) : 0;
     *(uint64_t *)(ms + 8) = total;
     *(uint64_t *)(ms + 16) = avail;
@@ -2028,7 +2253,15 @@ static WINAPI DWORD k32_FormatMessageA(DWORD f, LPCVOID s, DWORD id, DWORD l, LP
 }
 
 /* ================= 其他 DLL ================= */
-static WINAPI BOOL adv_SystemFunction036(void *buf, ULONG_PTR n) { return getrandom(buf, n, 0) == (ssize_t)n; }
+static WINAPI BOOL adv_SystemFunction036(void *buf, ULONG_PTR n)
+{
+#ifdef __linux__
+    return getrandom(buf, n, 0) == (ssize_t)n;
+#else
+    arc4random_buf(buf, n);
+    return TRUE;
+#endif
+}
 static WINAPI LONG adv_RegOpenKeyExW(HANDLE k, LPCWSTR s, DWORD o, DWORD a, HANDLE *r) { (void)k; (void)s; (void)o; (void)a; if (r) *r = NULL; return ERROR_FILE_NOT_FOUND; }
 static WINAPI LONG adv_RegQueryValueExW(HANDLE k, LPCWSTR n, DWORD *r, DWORD *t, BYTE *d, DWORD *l) { (void)k; (void)n; (void)r; (void)t; (void)d; (void)l; return ERROR_FILE_NOT_FOUND; }
 static WINAPI LONG adv_RegGetValueW(HANDLE k, LPCWSTR s, LPCWSTR v, DWORD f, DWORD *t, void *d, DWORD *l) { (void)k; (void)s; (void)v; (void)f; (void)t; (void)d; (void)l; return ERROR_FILE_NOT_FOUND; }

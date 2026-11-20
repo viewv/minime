@@ -1,0 +1,80 @@
+name: FreeBSD Release
+
+on:
+  push:
+    tags: ['v*-bsd*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已有的 BSD 标签（例如 v0.2.1-bsd.1）
+        required: true
+
+jobs:
+  package:
+    name: package (FreeBSD ${{ matrix.release }} amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14", "15"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Check tag matches VERSION
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          V="v$(cat VERSION)-bsd"
+          case "$TAG" in
+            "$V"*) ;;
+            *) echo "BSD 标签 $TAG 应以 $V 开头" >&2; exit 1 ;;
+          esac
+      - name: Build and package in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          arch: x86_64
+          cpu: 4
+          mem: 8192
+          copyback: true
+          prepare: |
+            pkg install -y gmake cmake pkgconf python3 7-zip curl rust \
+              fcitx5 shaderc vulkan-headers vulkan-loader
+          run: |
+            set -e
+            gmake
+            (cd netd && cargo test --release --locked)
+            sh packaging/freebsd/build-pkg.sh
+            # 清理中间构建目录，仅让 copyback 带回 dist/
+            rm -rf build fcitx5-minime/build netd/target asrd/target settings/target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-freebsd-${{ matrix.release }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create BSD pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "$TAG" dist/* --prerelease \
+            --title "MinIME $TAG (FreeBSD experimental)" \
+            --notes-file .github/release-notes-bsd.md

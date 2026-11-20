@@ -1,0 +1,42 @@
+name: FreeBSD CI
+
+on:
+  push:
+    branches: [exp/bsd]
+  pull_request:
+    branches: [exp/bsd]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (FreeBSD ${{ matrix.release }} amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14", "15"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test and package in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          arch: x86_64
+          cpu: 4
+          mem: 8192
+          copyback: false
+          prepare: |
+            pkg install -y gmake cmake pkgconf python3 7-zip curl rust \
+              fcitx5 shaderc vulkan-headers vulkan-loader
+          run: |
+            set -e
+            uname -a
+            freebsd-version -ku
+            cc --version
+            rustc --version
+            cargo --version
+            gmake
+            gmake -C loader ../build/native/tflite_smoke
+            (cd netd && cargo test --release --locked)
+            sh packaging/freebsd/build-pkg.sh

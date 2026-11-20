@@ -60,4 +60,7 @@ void pe_thread_exit_hooks(void);
 /* 从 sp 往上扫栈，打印落在 PE 模块里的返回地址（粗略回溯） */
 void pe_dump_stack(void *sp, int max);
 
+/* 当前线程的宿主内核线程号（给 TEB 和兼容层用） */
+uint64_t pe_host_tid(void);
+
 #endif

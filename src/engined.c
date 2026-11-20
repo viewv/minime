@@ -2105,6 +2105,19 @@ static void data_path(char *out, size_t n, const char *rel)
         snprintf(out, n, "%s/.local/share/minime/%s", h ? h : "", rel);
 }
 
+static int peer_uid_matches(int fd)
+{
+#ifdef __linux__
+    struct ucred cr;
+    socklen_t l = sizeof(cr);
+    return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &l) == 0 && cr.uid == getuid();
+#else
+    uid_t euid;
+    gid_t egid;
+    return getpeereid(fd, &euid, &egid) == 0 && euid == getuid();
+#endif
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 || argc > 3 || (argc > 1 && argv[1][0] == '-')) {
@@ -2243,9 +2256,7 @@ int main(int argc, char **argv)
             learn_step();                       /* 学习：事件到了或超时了就推进一步 */
         if (cfd >= 0 && (pf[3 + nconn].revents & POLLIN)) {
             int fd = accept4(cfd, NULL, NULL, SOCK_CLOEXEC);
-            struct ucred cr;
-            socklen_t l = sizeof(cr);
-            if (fd >= 0 && getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &l) == 0 && cr.uid == getuid())
+            if (fd >= 0 && peer_uid_matches(fd))
                 ctl_handle(fd);
             if (fd >= 0)
                 close(fd);
@@ -2266,9 +2277,7 @@ int main(int argc, char **argv)
             if (fd < 0)
                 continue;
             if (i == 0) {
-                struct ucred cr;
-                socklen_t l = sizeof(cr);
-                if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &l) < 0 || cr.uid != getuid()) {
+                if (!peer_uid_matches(fd)) {
                     close(fd);
                     continue;
                 }

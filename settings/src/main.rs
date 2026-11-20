@@ -1429,6 +1429,11 @@ impl Settings {
 
     /// 重启一个后台服务（后台执行 systemctl，完成后发 toast 并刷新状态）
     fn restart_service(&mut self, unit: &'static str, name: &'static str, cx: &mut Context<Self>) {
+        if !has_systemctl() {
+            self.toast = Some(("非 systemd 环境，请手动重启服务".into(), false, Instant::now()));
+            cx.notify();
+            return;
+        }
         if unit == "minime-engined.service" {
             self.restart_engine(cx); // 复用词库页的重启：等引擎重新写状态文件再提示
             return;
@@ -1540,8 +1545,46 @@ fn official_engine_present() -> bool {
     official_dir().join("win/3.0.1.35/libwxhld.dll").exists()
 }
 
+fn has_systemctl() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        std::process::Command::new("systemctl")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+fn runtime_dir() -> std::path::PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+}
+
+fn engined_sock_dir() -> std::path::PathBuf {
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(rt) if !rt.is_empty() => std::path::PathBuf::from(rt).join("minime"),
+        _ => std::path::PathBuf::from(format!("/tmp/minime-{}", current_uid())),
+    }
+}
+
 /// 引擎服务在不在跑
 fn engine_running() -> bool {
+    if !has_systemctl() {
+        return UnixStream::connect(engined_sock_dir().join("engine.sock")).is_ok();
+    }
     std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "minime-engined.service"])
         .status()
@@ -1551,6 +1594,24 @@ fn engine_running() -> bool {
 
 /// 各服务的 systemctl is-active 结果（没装的单元是 "inactive" 或 "unknown"，装没装另外看单元文件）
 fn service_states() -> [String; 3] {
+    if !has_systemctl() {
+        let eng = if UnixStream::connect(engined_sock_dir().join("ctl.sock")).is_ok() {
+            "active"
+        } else {
+            "inactive"
+        };
+        let net = if UnixStream::connect(netd::socket_path()).is_ok() {
+            "active"
+        } else {
+            "inactive"
+        };
+        let asr = if runtime_dir().join("minime-asrd.sock").exists() {
+            "active"
+        } else {
+            "inactive"
+        };
+        return [eng.into(), net.into(), asr.into()];
+    }
     let out = std::process::Command::new("systemctl")
         .args(["--user", "is-active"])
         .args(SERVICES.iter().map(|s| s.0))
@@ -1803,6 +1864,11 @@ impl Settings {
     }
 
     fn restart_engine(&mut self, cx: &mut Context<Self>) {
+        if !has_systemctl() {
+            self.toast = Some(("非 systemd 环境，请手动重启服务".into(), false, Instant::now()));
+            cx.notify();
+            return;
+        }
         let child = std::process::Command::new("systemctl")
             .args(["--user", "restart", "minime-engined"])
             .stdout(std::process::Stdio::null())

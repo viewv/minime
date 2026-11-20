@@ -2,7 +2,13 @@
 #define _GNU_SOURCE
 #include "pe.h"
 
-#include <asm/prctl.h>
+#if !defined(__x86_64__) && !defined(_M_X64)
+#error "MinIME 原生 PE 装载器仅支持 x86_64/amd64 架构"
+#endif
+#if defined(__OpenBSD__)
+#error "OpenBSD 禁止用户态设置 %gs 基址（Windows x64 TEB 必需），暂不支持"
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -14,9 +20,49 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+#elif defined(__FreeBSD__)
+#include <machine/sysarch.h>
+#include <pthread_np.h>
+#elif defined(__NetBSD__)
+#include <lwp.h>
+#include <machine/sysarch.h>
+#include <sys/types.h>
+#elif defined(__DragonFly__)
+#include <machine/sysarch.h>
+#include <pthread_np.h>
+#include <sys/lwp.h>
+#endif
+
+#if defined(MAP_FIXED_NOREPLACE)
+#define PE_MAP_FIXED_NOREPLACE MAP_FIXED_NOREPLACE
+#elif defined(__FreeBSD__) && defined(MAP_EXCL)
+#define PE_MAP_FIXED_NOREPLACE (MAP_FIXED | MAP_EXCL)
+#elif defined(__NetBSD__) && defined(MAP_TRYFIXED)
+#define PE_MAP_FIXED_NOREPLACE MAP_TRYFIXED
+#else
+#define PE_MAP_FIXED_NOREPLACE 0
+#endif
+
+uint64_t pe_host_tid(void)
+{
+#if defined(__linux__)
+    return (uint64_t)syscall(SYS_gettid);
+#elif defined(__FreeBSD__)
+    return (uint64_t)(unsigned int)pthread_getthreadid_np();
+#elif defined(__NetBSD__)
+    return (uint64_t)(unsigned int)_lwp_self();
+#elif defined(__DragonFly__)
+    return (uint64_t)(unsigned int)lwp_gettid();
+#else
+    return (uint64_t)(uintptr_t)pthread_self();
+#endif
+}
 
 /* ---------------- PE 结构（只列用到的） ---------------- */
 #pragma pack(push, 1)
@@ -137,7 +183,7 @@ static void *make_unknown_thunk(const char *dll, const char *name)
 {
     if (!g_thunk_cur || g_thunk_cur + 32 > g_thunk_end) {
         size_t sz = 1 << 20;
-        g_thunk_page = mmap(NULL, sz, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        g_thunk_page = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (g_thunk_page == MAP_FAILED) {
             perror("mmap thunk");
             abort();
@@ -148,10 +194,13 @@ static void *make_unknown_thunk(const char *dll, const char *name)
     char *label = malloc(strlen(dll) + strlen(name) + 2);
     sprintf(label, "%s!%s", dll, name);
     uint8_t *p = g_thunk_cur;
+    uintptr_t pg = (uintptr_t)p & ~(uintptr_t)4095;
+    mprotect((void *)pg, 4096, PROT_READ | PROT_WRITE);
     void *handler = (void *)unknown_import_handler;
     *p++ = 0x49; *p++ = 0xBA; memcpy(p, &label, 8); p += 8;       /* mov r10, imm64 */
     *p++ = 0x48; *p++ = 0xB8; memcpy(p, &handler, 8); p += 8;     /* mov rax, imm64 */
     *p++ = 0xFF; *p++ = 0xE0;                                     /* jmp rax */
+    mprotect((void *)pg, 4096, PROT_READ | PROT_EXEC);
     void *ret = g_thunk_cur;
     g_thunk_cur += 32;
     return ret;
@@ -303,10 +352,11 @@ static uint8_t *teb_create(void)
     memset(teb, 0, TEB_SIZE);
     *(uint8_t **)(teb + TEB_SELF) = teb;
     *(uint64_t *)(teb + TEB_PID) = (uint64_t)getpid();
-    *(uint64_t *)(teb + TEB_TID) = (uint64_t)syscall(SYS_gettid);
+    *(uint64_t *)(teb + TEB_TID) = pe_host_tid();
     *(uint8_t **)(teb + TEB_PEB) = g_peb;
     *(void **)(teb + TEB_FLS_DATA) = calloc(128, sizeof(void *));
     pthread_attr_t a;
+#if defined(__linux__) || defined(__NetBSD__)
     if (!pthread_getattr_np(pthread_self(), &a)) {
         void *lo;
         size_t sz;
@@ -315,7 +365,43 @@ static uint8_t *teb_create(void)
         *(uint8_t **)(teb + TEB_STACK_BASE) = (uint8_t *)lo + sz;
         pthread_attr_destroy(&a);
     }
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+    pthread_attr_init(&a);
+    if (!pthread_attr_get_np(pthread_self(), &a)) {
+        void *lo;
+        size_t sz;
+        pthread_attr_getstack(&a, &lo, &sz);
+        *(uint8_t **)(teb + TEB_STACK_LIMIT) = (uint8_t *)lo;
+        *(uint8_t **)(teb + TEB_STACK_BASE) = (uint8_t *)lo + sz;
+    }
+    pthread_attr_destroy(&a);
+#endif
     return teb;
+}
+
+static void pe_set_gsbase(void *base)
+{
+#if defined(__linux__)
+    if (syscall(SYS_arch_prctl, ARCH_SET_GS, base) != 0) {
+        perror("arch_prctl(ARCH_SET_GS)");
+        abort();
+    }
+#elif defined(__FreeBSD__)
+    if (amd64_set_gsbase(base) != 0) {
+        perror("amd64_set_gsbase");
+        abort();
+    }
+#elif defined(__NetBSD__)
+    if (sysarch(X86_64_SET_GSBASE, &base) != 0) {
+        perror("sysarch(X86_64_SET_GSBASE)");
+        abort();
+    }
+#elif defined(__DragonFly__)
+    if (sysarch(AMD64_SET_GSBASE, &base) != 0) {
+        perror("sysarch(AMD64_SET_GSBASE)");
+        abort();
+    }
+#endif
 }
 
 void pe_thread_attach(void)
@@ -323,10 +409,7 @@ void pe_thread_attach(void)
     if (t_teb)
         return;
     t_teb = teb_create();
-    if (syscall(SYS_arch_prctl, ARCH_SET_GS, t_teb) != 0) {
-        perror("arch_prctl(ARCH_SET_GS)");
-        abort();
-    }
+    pe_set_gsbase(t_teb);
     pthread_mutex_lock(&g_load_lock);
     thread_setup_tls(t_teb);
     pthread_mutex_unlock(&g_load_lock);
@@ -388,16 +471,53 @@ void pe_dump_stack(void *spv, int max)
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     ucontext_t *uc = ctx;
-    uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
+#if defined(__linux__)
+    uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    uint64_t rax = (uint64_t)uc->uc_mcontext.gregs[REG_RAX];
+    uint64_t rbx = (uint64_t)uc->uc_mcontext.gregs[REG_RBX];
+    uint64_t rcx = (uint64_t)uc->uc_mcontext.gregs[REG_RCX];
+    uint64_t rdx = (uint64_t)uc->uc_mcontext.gregs[REG_RDX];
+    uint64_t rsi = (uint64_t)uc->uc_mcontext.gregs[REG_RSI];
+    uint64_t rdi = (uint64_t)uc->uc_mcontext.gregs[REG_RDI];
+    uint64_t r8  = (uint64_t)uc->uc_mcontext.gregs[REG_R8];
+    uint64_t r9  = (uint64_t)uc->uc_mcontext.gregs[REG_R9];
+    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+    uint64_t rip = (uint64_t)uc->uc_mcontext.mc_rip;
+    uint64_t rax = (uint64_t)uc->uc_mcontext.mc_rax;
+    uint64_t rbx = (uint64_t)uc->uc_mcontext.mc_rbx;
+    uint64_t rcx = (uint64_t)uc->uc_mcontext.mc_rcx;
+    uint64_t rdx = (uint64_t)uc->uc_mcontext.mc_rdx;
+    uint64_t rsi = (uint64_t)uc->uc_mcontext.mc_rsi;
+    uint64_t rdi = (uint64_t)uc->uc_mcontext.mc_rdi;
+    uint64_t r8  = (uint64_t)uc->uc_mcontext.mc_r8;
+    uint64_t r9  = (uint64_t)uc->uc_mcontext.mc_r9;
+    uint64_t rsp = (uint64_t)uc->uc_mcontext.mc_rsp;
+#elif defined(__NetBSD__)
+    uint64_t rip = (uint64_t)uc->uc_mcontext.__gregs[_REG_RIP];
+    uint64_t rax = (uint64_t)uc->uc_mcontext.__gregs[_REG_RAX];
+    uint64_t rbx = (uint64_t)uc->uc_mcontext.__gregs[_REG_RBX];
+    uint64_t rcx = (uint64_t)uc->uc_mcontext.__gregs[_REG_RCX];
+    uint64_t rdx = (uint64_t)uc->uc_mcontext.__gregs[_REG_RDX];
+    uint64_t rsi = (uint64_t)uc->uc_mcontext.__gregs[_REG_RSI];
+    uint64_t rdi = (uint64_t)uc->uc_mcontext.__gregs[_REG_RDI];
+    uint64_t r8  = (uint64_t)uc->uc_mcontext.__gregs[_REG_R8];
+    uint64_t r9  = (uint64_t)uc->uc_mcontext.__gregs[_REG_R9];
+    uint64_t rsp = (uint64_t)uc->uc_mcontext.__gregs[_REG_RSP];
+#else
+    (void)uc;
+    uint64_t rip = 0, rax = 0, rbx = 0, rcx = 0, rdx = 0, rsi = 0, rdi = 0, r8 = 0, r9 = 0, rsp = 0;
+#endif
     pe_module *m = pe_module_by_addr((void *)rip);
     fprintf(stderr, "\n[loader] 信号 %d，地址 %p，rip=%#lx", sig, si->si_addr, (unsigned long)rip);
     if (m)
         fprintf(stderr, "（%s+%#lx）", m->name, (unsigned long)(rip - (uint64_t)m->base));
-    fprintf(stderr, "\n[loader] rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx rsi=%#llx rdi=%#llx r8=%#llx r9=%#llx\n",
-            uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX], uc->uc_mcontext.gregs[REG_RCX],
-            uc->uc_mcontext.gregs[REG_RDX], uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
-            uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9]);
-    pe_dump_stack((void *)uc->uc_mcontext.gregs[REG_RSP], 12);
+    fprintf(stderr, "\n[loader] rax=%#lx rbx=%#lx rcx=%#lx rdx=%#lx rsi=%#lx rdi=%#lx r8=%#lx r9=%#lx\n",
+            (unsigned long)rax, (unsigned long)rbx, (unsigned long)rcx,
+            (unsigned long)rdx, (unsigned long)rsi, (unsigned long)rdi,
+            (unsigned long)r8, (unsigned long)r9);
+    if (rsp)
+        pe_dump_stack((void *)rsp, 12);
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -692,7 +812,7 @@ static pe_module *load_one(const char *path, InitList *init)
         if (want < oh->ImageBase || want + oh->SizeOfImage > 0x7ff000000000ULL)
             break;
         base = mmap((void *)(uintptr_t)want, oh->SizeOfImage, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                    MAP_PRIVATE | MAP_ANONYMOUS | PE_MAP_FIXED_NOREPLACE, -1, 0);
         if (base != MAP_FAILED && base != (uint8_t *)(uintptr_t)want) {   /* 老内核不认 NOREPLACE */
             munmap(base, oh->SizeOfImage);
             base = MAP_FAILED;

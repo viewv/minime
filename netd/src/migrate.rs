@@ -138,8 +138,10 @@ fn ctl_path() -> PathBuf {
     match std::env::var("XDG_RUNTIME_DIR") {
         Ok(rt) if !rt.is_empty() => PathBuf::from(rt).join("minime/ctl.sock"),
         _ => {
-            use std::os::unix::fs::MetadataExt;
-            let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+            extern "C" {
+                fn getuid() -> u32;
+            }
+            let uid = unsafe { getuid() };
             PathBuf::from(format!("/tmp/minime-{uid}/ctl.sock"))
         }
     }

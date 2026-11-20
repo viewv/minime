@@ -6,6 +6,19 @@
  * - 一次前向（12 层，约 100 次派发）录进一个命令缓冲，提交一次、等一次。
  */
 #define _GNU_SOURCE
+#ifdef MINIME_NO_VULKAN
+#include <stdio.h>
+
+#include "e2e_internal.h"
+
+E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
+{
+    (void)w;
+    if (err && errlen)
+        snprintf(err, errlen, "编译时未启用 Vulkan");
+    return NULL;
+}
+#else
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
 #include <stdio.h>
@@ -723,3 +736,4 @@ E2EBackend *e2e_vk_new(const E2EWeights *w, char *err, size_t errlen)
     return &v->base;
 #undef FAIL
 }
+#endif

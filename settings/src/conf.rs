@@ -141,7 +141,7 @@ impl Ini {
         let tmp = p.with_extension("conf.tmp");
         std::fs::write(&tmp, self.to_text())?;
         std::fs::rename(&tmp, &p)?;
-        if let Ok(mut child) = std::process::Command::new("busctl")
+        let reload = std::process::Command::new("busctl")
             .args([
                 "--user",
                 "call",
@@ -155,7 +155,21 @@ impl Ini {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-        {
+            .or_else(|_| {
+                std::process::Command::new("dbus-send")
+                    .args([
+                        "--session",
+                        "--type=method_call",
+                        "--dest=org.fcitx.Fcitx5",
+                        "/controller",
+                        "org.fcitx.Fcitx.Controller1.ReloadAddonConfig",
+                        "string:minime",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+            });
+        if let Ok(mut child) = reload {
             std::thread::spawn(move || {
                 let _ = child.wait();
             });

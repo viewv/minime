@@ -411,7 +411,10 @@ def fcitx(*args):
 
 def setup_fcitx5():
     """把 MinIME 加进 fcitx5 当前的输入法分组（已经在了就不动）。"""
-    if not shutil.which("busctl") or fcitx("CurrentInputMethodGroup") is None:
+    if not shutil.which("busctl"):
+        say("提示：没有 busctl，请在 fcitx5 配置里手动添加「MinIME」")
+        return
+    if fcitx("CurrentInputMethodGroup") is None:
         say("提示：fcitx5 没有在运行。启用 fcitx5 后，在 fcitx5 配置里添加「MinIME」，"
             "或者再运行一次 minime-fetch setup")
         return

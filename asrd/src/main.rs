@@ -151,9 +151,10 @@ fn fetch_model() -> Result<(), String> {
 // ------------------------------------------------------------------ 录音
 
 fn spawn_recorder() -> Result<Child, String> {
-    let tries: [(&str, &[&str]); 2] = [
+    let tries: [(&str, &[&str]); 3] = [
         ("pw-record", &["--rate", "16000", "--channels", "1", "--format", "s16", "--raw", "-"]),
         ("parec", &["--raw", "--rate=16000", "--channels=1", "--format=s16le", "--latency-msec=50"]),
+        ("rec", &["-q", "-t", "raw", "-r", "16000", "-c", "1", "-b", "16", "-e", "signed-integer", "-L", "-"]),
     ];
     let mut last = String::new();
     for (bin, args) in tries {
@@ -449,11 +450,7 @@ fn daemon() -> i32 {
     let serial = AtomicU64::new(0);
     for conn in listener.incoming().flatten() {
         // 只接受同一用户
-        let uid_ok = {
-            use std::os::unix::fs::MetadataExt;
-            let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
-            peer_uid(&conn) == me
-        };
+        let uid_ok = peer_uid(&conn) == Some(current_uid());
         if !uid_ok {
             continue;
         }
@@ -475,6 +472,14 @@ fn daemon() -> i32 {
     0
 }
 
+fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+#[cfg(target_os = "linux")]
 fn peer_uid(s: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
@@ -492,6 +497,24 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
     let mut len = std::mem::size_of::<Ucred>() as u32;
     let r = unsafe { getsockopt(s.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, &mut c, &mut len) };
     (r == 0).then_some(c.uid)
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos"
+))]
+fn peer_uid(s: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn getpeereid(fd: i32, euid: *mut u32, egid: *mut u32) -> i32;
+    }
+    let mut uid = u32::MAX;
+    let mut gid = u32::MAX;
+    let r = unsafe { getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
+    (r == 0).then_some(uid)
 }
 
 fn parse_wav_pcm(data: &[u8]) -> Result<&[u8], &'static str> {
@@ -565,7 +588,10 @@ fn say() -> i32 {
     let mut s = match UnixStream::connect(socket_path()) {
         Ok(s) => s,
         Err(e) => {
+            #[cfg(target_os = "linux")]
             eprintln!("连不上 minime-asrd：{e}（systemctl --user start minime-asrd）");
+            #[cfg(not(target_os = "linux"))]
+            eprintln!("连不上 minime-asrd：{e}（请先运行 minime-asrd daemon）");
             return 1;
         }
     };

@@ -107,7 +107,7 @@ static plat_lib plat_load_engine(const char *install_dir)
         if ((size_t)RVA + 2 <= m->size && at[0] == 0x75 && at[1] == 0x7f) {
             long pg = sysconf(_SC_PAGESIZE);
             uint8_t *page = (uint8_t *)((uintptr_t)at & ~(uintptr_t)(pg - 1));
-            if (mprotect(page, (size_t)pg * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            if (mprotect(page, (size_t)pg * 2, PROT_READ | PROT_WRITE) == 0) {
                 at[0] = 0xeb;
                 mprotect(page, (size_t)pg * 2, PROT_READ | PROT_EXEC);
             } else {
@@ -186,7 +186,7 @@ static int plat_patch(void *addr, const void *bytes, size_t n)
 {
     uintptr_t a = (uintptr_t)addr & ~4095UL;
     size_t len = ((uintptr_t)addr + n - a + 4095) & ~4095UL;
-    if (mprotect((void *)a, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+    if (mprotect((void *)a, len, PROT_READ | PROT_WRITE) != 0)
         return -1;
     memcpy(addr, bytes, n);
     mprotect((void *)a, len, PROT_READ | PROT_EXEC);

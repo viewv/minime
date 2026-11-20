@@ -16,6 +16,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#include <sys/user.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -470,16 +474,36 @@ static WINAPI DWORD f_GetFinalPathNameByHandleW(HANDLE h, LPWSTR out, DWORD n, D
     KObj *o = file_obj(h);
     if (!o)
         return 0;
-    char link[64], buf[PATH_MAX];
+    char buf[PATH_MAX];
+    int ok = 0;
+#if defined(__linux__)
+    char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", o->fd);
     ssize_t r = readlink(link, buf, sizeof(buf) - 1);
-    if (r < 0)
-        return 0;
-    buf[r] = 0;
-    long w = utf8_to_u16((const unsigned char *)buf, r, NULL, 0);
-    if ((DWORD)w + 1 > n)
+    if (r >= 0) {
+        buf[r] = 0;
+        ok = 1;
+    }
+#elif defined(__FreeBSD__) && defined(F_KINFO)
+    struct kinfo_file kf;
+    memset(&kf, 0, sizeof(kf));
+    kf.kf_structsize = sizeof(kf);
+    if (fcntl(o->fd, F_KINFO, &kf) == 0 && kf.kf_path[0]) {
+        snprintf(buf, sizeof(buf), "%s", kf.kf_path);
+        ok = 1;
+    }
+#endif
+    if (!ok) {
+        if (!o->path)
+            return 0;
+        if (!realpath(o->path, buf))
+            snprintf(buf, sizeof(buf), "%s", o->path);
+    }
+    size_t blen = strlen(buf);
+    long w = utf8_to_u16((const unsigned char *)buf, (long)blen, NULL, 0);
+    if (!out || (DWORD)w + 1 > n)
         return (DWORD)w + 1;
-    utf8_to_u16((const unsigned char *)buf, r, out, n);
+    utf8_to_u16((const unsigned char *)buf, (long)blen, out, n);
     out[w] = 0;
     return (DWORD)w;
 }
@@ -757,7 +781,22 @@ static WINAPI HANDLE f_CreateFileMappingW(HANDLE file, void *sa, DWORD prot, DWO
     uint64_t size = ((uint64_t)hi << 32) | lo;
     int fd;
     if (file == INVALID_HANDLE_VALUE) {
+#if defined(__linux__)
         fd = memfd_create("minime-mapping", MFD_CLOEXEC);
+#elif defined(SHM_ANON)
+        fd = shm_open(SHM_ANON, O_RDWR | O_CLOEXEC, 0600);
+#elif defined(MFD_CLOEXEC)
+        fd = memfd_create("minime-mapping", MFD_CLOEXEC);
+#else
+        const char *tmp = getenv("TMPDIR");
+        char tmpl[PATH_MAX];
+        snprintf(tmpl, sizeof(tmpl), "%s/minime-map-XXXXXX", (tmp && *tmp) ? tmp : "/tmp");
+        fd = mkstemp(tmpl);
+        if (fd >= 0) {
+            unlink(tmpl);
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+#endif
         if (fd < 0 || ftruncate(fd, (off_t)size) != 0) {
             if (fd >= 0)
                 close(fd);

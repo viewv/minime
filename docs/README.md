@@ -11,6 +11,7 @@
 | [cross-device](cross-device.md) | 跨设备功能：关联手机、剪贴板、常用语、个人词库、换机助手、云输入 |
 | [privacy](privacy.md) | 隐私：哪些数据留在本机、哪些会发给服务器 |
 | [packaging](packaging.md) | 打包和安装布局（Arch、Debian / Ubuntu、Fedora） |
+| [bsd](bsd.md) | 在 FreeBSD / GhostBSD 上编译、安装、自启、配置和打开云输入（实验性） |
 | [development](development.md) | 开发：构建、测试工具、调试开关、代码结构 |
 
 MinIME 目前是测试版，文档描述的是 0.2.1 的行为，可能随版本变化。
